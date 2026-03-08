@@ -213,12 +213,17 @@ class RayDAPOTrainer(RayPPOTrainer):
                 self.gen_steps += 1
 
             # update train_problems and inmemory_dataloader
-            train_problems,next_problem_id = self.update_problems_simple(train_problems,next_problem_id)
-            inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
+            timing_raw = defaultdict(float)
+            with marked_timer("update_problems", timing_raw, "blue"):
+                train_problems,next_problem_id = self.update_problems_simple(train_problems,next_problem_id)
+                inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
 
-            # Log next_problem_id as a metric
-            problem_id_metrics = {"train/next_problem_id": next_problem_id}
-            logger.log(data=problem_id_metrics, step=self.global_steps)
+            # Log next_problem_id and update_problems timing as metrics
+            update_metrics = {
+                "train/next_problem_id": next_problem_id,
+                "timing/update_problems": timing_raw["update_problems"]
+            }
+            logger.log(data=update_metrics, step=self.global_steps)
         # check if last step checkpint exists
         checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
         if not os.path.exists(checkpoint_dir):
