@@ -414,8 +414,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             config=self.config.data
         )
         from verl.trainer.main_ppo import  create_rl_sampler
-        if train_sampler is None:
-            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+        train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
             from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
