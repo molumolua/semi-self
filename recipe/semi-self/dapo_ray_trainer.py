@@ -39,6 +39,7 @@ from verl.trainer.ppo.ray_trainer import (
     compute_response_mask,
 )
 from verl.trainer.ppo.reward import compute_reward
+from verl.utils.dataset import inmemory_dataset
 from verl.utils.dataset.inmemory_dataset import InMemoryRLHFDataset
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
@@ -139,20 +140,22 @@ class RayDAPOTrainer(RayPPOTrainer):
         num_gen_batches = 0
         
 
-        train_problems = self.train_dataloader[0: self.config.data.train_batch_size]
-        train_dataset = InMemoryRLHFDataset(
-            data_list=train_problems,
-            tokenizer=self.tokenizer,
-            processor=self.processor,
-            config=self.config.data
-        )
+        # Get train problems directly from the dataset (not from dataloader)
+        # since StatefulDataLoader is not subscriptable
+        train_problems = []
+        for i in range(min(self.config.data.train_batch_size, len(self.train_dataset))):
+            problem = self.train_dataset[i]
+            train_problems.append(problem)
+
+
+        inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
 
         next_problem_id = self.config.data.train_batch_size
 
 
         for epoch in range(self.config.trainer.total_epochs):
             # only one batch for InMemoryRLHFDataset
-            for batch_dict in train_dataset:
+            for batch_dict in inmemory_dataloader:
                 is_last_step = self.global_steps >= self.total_training_steps
                 metrics= self.train_batch(batch_dict,prev_step_profile,curr_step_profile,timing_raw)
                 # validate
@@ -212,14 +215,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                 self.global_steps += 1
                 self.gen_steps += 1
 
-            # update train_problems and train_dataset
+            # update train_problems and inmemory_dataloader
             train_problems,next_problem_id = self.update_problems_simple(train_problems,next_problem_id)
-            train_dataset = InMemoryRLHFDataset(
-                data_list=train_problems,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-                config=self.config.data
-            )
+            inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
 
             # Log next_problem_id as a metric
             problem_id_metrics = {"train/next_problem_id": next_problem_id}
@@ -407,7 +405,31 @@ class RayDAPOTrainer(RayPPOTrainer):
                 self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
             
             return metrics
+        
+    def createInmemoryDataLoader(self,train_problems):
+        train_dataset = InMemoryRLHFDataset(
+            data_list=train_problems,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            config=self.config.data
+        )
+        from verl.trainer.main_ppo import  create_rl_sampler
+        if train_sampler is None:
+            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+        if collate_fn is None:
+            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
+            collate_fn = default_collate_fn
+        num_workers = self.config.data["dataloader_num_workers"]
+        inmemory_dataloader=StatefulDataLoader(
+            dataset=train_dataset,
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            num_workers=num_workers,
+            drop_last=True,
+            collate_fn=collate_fn,
+            sampler=train_sampler,
+        )
+        return inmemory_dataloader
     def update_problems(self, original_problems, num_variations_per_problem=8):
         """
         Generate new problems by upgrading or downgrading the difficulty of original problems.
