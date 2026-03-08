@@ -137,6 +137,8 @@ class TaskRunner:
                 from verl.workers.fsdp_workers import RewardModelWorker
             elif config.reward_model.strategy == "megatron":
                 from verl.workers.megatron_workers import RewardModelWorker
+            elif config.reward_model.strategy == 'verifier':
+                from recipe.baseline.verifier import RewardModelWorker
             else:
                 raise NotImplementedError
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
@@ -150,18 +152,14 @@ class TaskRunner:
         reward_fn = load_reward_manager(
             config,
             tokenizer,
-            0,
-            max_resp_len=config.data.max_response_length,
-            overlong_buffer_cfg=config.reward_model.overlong_buffer,
+            0
         )
 
         # Note that we always use function-based RM for validation
         val_reward_fn = load_reward_manager(
             config,
             tokenizer,
-            1,
-            max_resp_len=config.data.max_response_length,
-            overlong_buffer_cfg=config.reward_model.overlong_buffer,
+            1
         )
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
