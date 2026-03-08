@@ -137,7 +137,6 @@ class RayDAPOTrainer(RayPPOTrainer):
         timing_raw = defaultdict(float)
         batch = None
         num_prompt_in_batch = 0
-        num_gen_batches = 0
         
 
         # Get train problems directly from the raw dataframe (not processed data)
@@ -158,7 +157,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             # only one batch for InMemoryRLHFDataset
             for batch_dict in inmemory_dataloader:
                 is_last_step = self.global_steps >= self.total_training_steps
-                metrics= self.train_batch(batch_dict,prev_step_profile,curr_step_profile,timing_raw)
+                batch,metrics= self.train_batch(batch_dict,prev_step_profile,curr_step_profile,timing_raw)
                 # validate
                 if (
                     self.val_reward_fn is not None
@@ -199,10 +198,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
                 timing_raw = defaultdict(float)  # clear timing
 
-                metrics["train/num_gen_batches"] = num_gen_batches
                 batch = None
-                num_prompt_in_batch = 0
-                num_gen_batches = 0
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
@@ -245,7 +241,6 @@ class RayDAPOTrainer(RayPPOTrainer):
             )
 
         new_batch: DataProto = DataProto.from_single_dict(batch_dict)
-        num_gen_batches += 1
         # pop those keys for generation
         if "multi_modal_data" in new_batch.non_tensor_batch.keys():
             gen_batch = new_batch.pop(
@@ -405,7 +400,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             if rollout_data_dir:
                 self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
             
-            return metrics
+            return batch,metrics
         
     def createInmemoryDataLoader(self,train_problems):
         train_dataset = InMemoryRLHFDataset(
@@ -598,4 +593,5 @@ Output:"""
         for problem in train_problems:
             updated_problem = dict(self.train_dataset.dataframe[current_id])
             current_id +=1
+            updated_problems.append(updated_problem)
         return updated_problems, current_id
