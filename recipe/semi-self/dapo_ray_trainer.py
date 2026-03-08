@@ -415,10 +415,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         )
         from verl.trainer.main_ppo import  create_rl_sampler
         train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
-        if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
-
-            collate_fn = default_collate_fn
+        from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+        collate_fn = default_collate_fn
         num_workers = self.config.data["dataloader_num_workers"]
         inmemory_dataloader=StatefulDataLoader(
             dataset=train_dataset,
