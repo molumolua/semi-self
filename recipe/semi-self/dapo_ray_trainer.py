@@ -140,11 +140,12 @@ class RayDAPOTrainer(RayPPOTrainer):
         num_gen_batches = 0
         
 
-        # Get train problems directly from the dataset (not from dataloader)
-        # since StatefulDataLoader is not subscriptable
+        # Get train problems directly from the raw dataframe (not processed data)
+        # since InMemoryRLHFDataset expects raw data with 'prompt' field
         train_problems = []
         for i in range(min(self.config.data.train_batch_size, len(self.train_dataset))):
-            problem = self.train_dataset[i]
+            # Get raw data from dataframe, not processed data from __getitem__
+            problem = dict(self.train_dataset.dataframe[i])
             train_problems.append(problem)
 
 
@@ -592,15 +593,9 @@ Output:"""
         """
         updated_problems = []
         current_id = next_problem_id
+        
 
         for problem in train_problems:
-            # Create a copy of the problem dict to avoid modifying the original
-            updated_problem = problem.copy()
-            # Assign consecutive IDs starting from next_problem_id
-            updated_problem['problem_id'] = current_id
-            updated_problems.append(updated_problem)
-            current_id += 1
-
-        # Return updated problems and the next available ID
-        new_next_problem_id = current_id
-        return updated_problems, new_next_problem_id
+            updated_problem = dict(self.train_dataset.dataframe[current_id])
+            current_id +=1
+        return updated_problems, current_id
