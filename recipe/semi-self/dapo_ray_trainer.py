@@ -135,7 +135,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         num_gen_batches = 0
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                metrics, is_last_step = self.train_batch(batch_dict,prev_step_profile,curr_step_profile,timing_raw)
+                is_last_step = self.global_steps >= self.total_training_steps
+                metrics= self.train_batch(batch_dict,prev_step_profile,curr_step_profile,timing_raw)
 
                 # validate
                 if (
@@ -231,7 +232,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
         )
 
-        is_last_step = self.global_steps >= self.total_training_steps
+        
 
         with marked_timer("step", timing_raw):
             # generate a batch
@@ -375,4 +376,4 @@ class RayDAPOTrainer(RayPPOTrainer):
             if rollout_data_dir:
                 self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
             
-            return metrics, is_last_step
+            return metrics
