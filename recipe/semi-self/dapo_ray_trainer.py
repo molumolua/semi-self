@@ -27,6 +27,7 @@ import torch
 from tqdm import tqdm
 
 from verl import DataProto
+from tensordict import TensorDict
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
 from verl.trainer.ppo.ray_trainer import (
@@ -377,3 +378,155 @@ class RayDAPOTrainer(RayPPOTrainer):
                 self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
             
             return metrics
+
+    def update_problems(self, original_problems, num_variations_per_problem=8):
+        """
+        Generate new problems by upgrading or downgrading the difficulty of original problems.
+
+        Args:
+            original_problems: List of dicts, each containing 'problem', 'answer', and 'difficulty_label'
+                             where difficulty_label is either 'upgrade' (make harder) or 'downgrade' (make easier)
+            num_variations_per_problem: Number of new problems to generate per original problem (M)
+
+        Returns:
+            List of dicts, each containing 'problem' and 'answer' keys for the generated problems
+        """
+        import torch
+        from verl import DataProto
+        from tensordict import TensorDict
+        import numpy as np
+        import json
+
+        # Create prompts for each original problem
+        prompts = []
+        for problem_data in original_problems:
+            problem = problem_data['problem']
+            answer = problem_data['answer']
+            label = problem_data['difficulty_label']
+
+            if label == 'upgrade':
+                # Create prompt to make the problem harder
+                prompt = f"""You are given a problem in JSON format. Create a more difficult version of this problem.
+Keep the core concept the same but increase the complexity, add more constraints, or require deeper understanding.
+
+Input:
+{{
+"problem": "{problem}",
+"answer": "{answer}"
+}}
+
+Generate a harder version and output in the same JSON format:
+{{
+"problem": "your harder problem here",
+"answer": "corresponding answer here"
+}}
+"""
+            elif label == 'downgrade':
+                # Create prompt to make the problem easier
+                prompt = f"""You are given a problem in JSON format. Create a simpler version of this problem.
+Keep the core concept the same but reduce the complexity, simplify the requirements, or make it more straightforward.
+
+Input:
+{{
+"problem": "{problem}",
+"answer": "{answer}"
+}}
+
+Generate an easier version and output in the same JSON format:
+{{
+"problem": "your easier problem here",
+"answer": "corresponding answer here"
+}}
+
+Output:"""
+            else:
+                raise ValueError(f"Invalid difficulty_label: {label}. Must be 'upgrade' or 'downgrade'")
+
+            prompts.append(prompt)
+
+        # Repeat each prompt M times
+        repeated_prompts = []
+        for prompt in prompts:
+            repeated_prompts.extend([prompt] * num_variations_per_problem)
+
+        # Tokenize prompts
+        tokenized_prompts = self.tokenizer(repeated_prompts, return_tensors='pt', padding=True, truncation=True)
+
+        # Create attention mask
+        attention_mask = tokenized_prompts['attention_mask']
+
+        # Create position ids
+        position_ids = torch.arange(attention_mask.size(1), dtype=torch.long).unsqueeze(0).expand(attention_mask.size(0), -1)
+
+        # Create TensorDict batch
+        batch = TensorDict({
+            "input_ids": tokenized_prompts['input_ids'],
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }, batch_size=len(repeated_prompts))
+
+        # Create DataProto
+        gen_batch = DataProto(
+            batch=batch,
+            non_tensor_batch={
+                "uid": np.arange(len(repeated_prompts)),
+                "data_source": np.array(["update_problems"] * len(repeated_prompts)),
+            },
+            meta_info={
+                "do_sample": True,
+                "temperature": 0.8,  # Add some creativity for problem generation
+                "max_new_tokens": 512,
+                "min_new_tokens": 50,
+            }
+        )
+
+        # Generate new problems using the policy model
+        generated_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+
+        # Extract the generated text
+        generated_sequences = generated_output.batch["input_ids"]  # This includes both prompt and generated text
+        attention_masks = generated_output.batch["attention_mask"]
+
+        new_problems = []
+        batch_size = len(repeated_prompts)
+
+        for i in range(batch_size):
+            # Find where the prompt ends and generation begins
+            prompt_length = attention_mask[i].sum().item()
+            generated_tokens = generated_sequences[i, prompt_length:]
+
+            # Decode the generated text
+            generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+            # Try to parse as JSON
+            parsed_problem = None
+            try:
+                # Find JSON in the generated text
+                start_idx = generated_text.find('{')
+                end_idx = generated_text.rfind('}') + 1
+                if start_idx != -1 and end_idx > start_idx:
+                    json_str = generated_text[start_idx:end_idx]
+                    parsed_data = json.loads(json_str)
+
+                    # Extract problem and answer
+                    if 'problem' in parsed_data and 'answer' in parsed_data:
+                        parsed_problem = {
+                            'problem': parsed_data['problem'],
+                            'answer': parsed_data['answer']
+                        }
+            except (json.JSONDecodeError, KeyError, TypeError):
+                # If JSON parsing fails, try to extract manually
+                pass
+
+            # If JSON parsing succeeded, use the parsed data
+            if parsed_problem:
+                new_problems.append(parsed_problem)
+            else:
+                # Fallback: use the raw text as problem, set answer as empty
+                # This handles cases where JSON parsing failed
+                new_problems.append({
+                    'problem': generated_text,
+                    'answer': ''
+                })
+
+        return new_problems
