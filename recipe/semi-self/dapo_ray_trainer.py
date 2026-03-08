@@ -220,6 +220,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                 processor=self.processor,
                 config=self.config.data
             )
+
+            # Log next_problem_id as a metric
+            problem_id_metrics = {"train/next_problem_id": next_problem_id}
+            logger.log(data=problem_id_metrics, step=self.global_steps)
         # check if last step checkpint exists
         checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
         if not os.path.exists(checkpoint_dir):
