@@ -150,5 +150,7 @@ PYTHONUNBUFFERED=1 python3 -m recipe.baseline.main_dapo \
     trainer.total_epochs=${epoch} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
-    +trainer.max_actor_ckpt_to_keep=1 
+    +trainer.max_actor_ckpt_to_keep=1  \
+    +data_config.custom_cls.path=recipe.semi-self.inmemory_dataset \
+    +data_config.custom_cls.name="InMemoryRLHFDataset"
 

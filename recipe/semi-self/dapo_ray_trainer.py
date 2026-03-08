@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 from verl import DataProto
 from tensordict import TensorDict
+from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
 from verl.trainer.ppo.ray_trainer import (
@@ -38,9 +39,11 @@ from verl.trainer.ppo.ray_trainer import (
     compute_response_mask,
 )
 from verl.trainer.ppo.reward import compute_reward
+from verl.utils.dataset.inmemory_dataset import InMemoryRLHFDataset
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
+
 
 
 
@@ -134,11 +137,24 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
+        
+
+        train_problems = self.train_dataloader[0: self.config.data.train_batch_size]
+        train_dataset = InMemoryRLHFDataset(
+            data_list=train_problems,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            config=self.config.data
+        )
+
+        next_problem_id = self.config.data.train_batch_size
+
+
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            # only one batch for InMemoryRLHFDataset
+            for batch_dict in train_dataset:
                 is_last_step = self.global_steps >= self.total_training_steps
                 metrics= self.train_batch(batch_dict,prev_step_profile,curr_step_profile,timing_raw)
-
                 # validate
                 if (
                     self.val_reward_fn is not None
@@ -195,6 +211,15 @@ class RayDAPOTrainer(RayPPOTrainer):
                 progress_bar.update(1)
                 self.global_steps += 1
                 self.gen_steps += 1
+
+            # update train_problems and train_dataset
+            train_problems,next_problem_id = self.update_problems_simple(train_problems,next_problem_id)
+            train_dataset = InMemoryRLHFDataset(
+                data_list=train_problems,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                config=self.config.data
+            )
         # check if last step checkpint exists
         checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
         if not os.path.exists(checkpoint_dir):
@@ -530,3 +555,29 @@ Output:"""
                 })
 
         return new_problems
+
+    def update_problems_simple(self, train_problems, next_problem_id):
+        """
+        Update all problems with consecutive IDs starting from next_problem_id.
+
+        Args:
+            train_problems: List of problem dictionaries
+            next_problem_id: Starting ID for the problems
+
+        Returns:
+            tuple: (updated_train_problems, new_next_problem_id)
+        """
+        updated_problems = []
+        current_id = next_problem_id
+
+        for problem in train_problems:
+            # Create a copy of the problem dict to avoid modifying the original
+            updated_problem = problem.copy()
+            # Assign consecutive IDs starting from next_problem_id
+            updated_problem['problem_id'] = current_id
+            updated_problems.append(updated_problem)
+            current_id += 1
+
+        # Return updated problems and the next available ID
+        new_next_problem_id = current_id
+        return updated_problems, new_next_problem_id
