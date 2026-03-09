@@ -101,6 +101,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         self.global_steps = 0
         self.gen_steps = 0
 
+
         # load checkpoint before doing anything
         self._load_checkpoint()
 
@@ -138,14 +139,22 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         
-
+        # TODO: 当难度出现反复时，
+        # self.all_train_object =[]
+        # for item in self.train_dataset.dataframe:
+        #     self.all_train_object.append({
+        #         "level":0,
+        #         "dict":{
+        #             0:item
+        #             }
+        #         })
         # Get train problems directly from the raw dataframe (not processed data)
         # since InMemoryRLHFDataset expects raw data with 'prompt' field
         train_problems = []
         for i in range(min(self.config.data.train_batch_size, len(self.train_dataset))):
             # Get raw data from dataframe, not processed data from __getitem__
             problem = dict(self.train_dataset.dataframe[i])
-            train_problems.append(problem)
+            train_problems.append({**problem,"action":"keep","keep_count":0,"problem_id":i})
 
 
         inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
@@ -212,17 +221,40 @@ class RayDAPOTrainer(RayPPOTrainer):
                 self.global_steps += 1
                 self.gen_steps += 1
 
-            # update train_problems and inmemory_dataloader
-            timing_raw = defaultdict(float)
-            with marked_timer("update_problems", timing_raw, "blue"):
-                train_problems,next_problem_id = self.update_problems_simple(train_problems,next_problem_id)
-                inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
+                # update train_problems and inmemory_dataloader
+                # Create a mock batch with actions for update_problems
+                from verl import DataProto
+                import numpy as np
 
-            # Log next_problem_id and update_problems timing as metrics
-            update_metrics = {
-                "train/next_problem_id": next_problem_id,
-                "timing/update_problems": timing_raw["update_problems"]
-            }
+                # Extract actions and keep_counts from current train_problems
+                actions = [p.get('action', 'keep') for p in train_problems]
+                keep_counts = [p.get('keep_count', 0) for p in train_problems]
+
+                # Create a minimal batch structure for update_problems
+                mock_batch = DataProto(
+                    batch={},  # Empty tensor batch
+                    non_tensor_batch={
+                        "action": np.array(actions, dtype=object),
+                        "keep_count": np.array(keep_counts, dtype=object)
+                    }
+                )
+
+                timing_raw = defaultdict(float)
+                with marked_timer("update_problems", timing_raw, "blue"):
+                    train_problems, next_problem_id, action_counts = self.update_problems(mock_batch, next_problem_id)
+                    inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
+
+                # Log next_problem_id, update_problems timing, and action counts as metrics
+                update_metrics = {
+                    "train/next_problem_id": next_problem_id,
+                    "timing/update_problems": timing_raw["update_problems"],
+                    "train/action_keep": action_counts["keep"],
+                    "train/action_replace": action_counts["replace"],
+                    "train/action_upgrade": action_counts["upgrade"],
+                    "train/action_degrade": action_counts["degrade"],
+                    "train/action_upgrade_success": action_counts["upgrade_success"],
+                    "train/action_degrade_success": action_counts["degrade_success"]
+                }
             logger.log(data=update_metrics, step=self.global_steps)
         # check if last step checkpint exists
         checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
@@ -336,6 +368,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                 else:
                     new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
 
+            # Update actions based on reward scores
+            self.update_action(new_batch)
+
             if not self.config.algorithm.filter_groups.enable:
                 batch = new_batch
             else:
@@ -428,22 +463,245 @@ class RayDAPOTrainer(RayPPOTrainer):
             sampler=train_sampler,
         )
         return inmemory_dataloader
-    def update_problems(self, original_problems, num_variations_per_problem=8):
+    def update_problems(self, batch, next_problem_id, num_variations_per_problem=4):
         """
-        Generate new problems by upgrading or downgrading the difficulty of original problems.
+        Update problems based on actions in the batch.
 
         Args:
-            original_problems: List of dicts, each containing 'problem', 'answer', and 'difficulty_label'
-                             where difficulty_label is either 'upgrade' (make harder) or 'downgrade' (make easier)
+            batch: DataProto batch containing actions and original problem data
+            next_problem_id: Starting ID for new problems (used for replace action)
             num_variations_per_problem: Number of new problems to generate per original problem (M)
 
         Returns:
-            List of dicts, each containing 'problem' and 'answer' keys for the generated problems
+            tuple: (updated_problems, new_next_problem_id) - same format as update_problems_simple
+        """
+        # Get actions and keep_counts from batch
+        actions = batch.non_tensor_batch.get("action", [])
+        keep_counts = batch.non_tensor_batch.get("keep_count", [])
+        problem_ids = batch.non_tensor_batch.get("problem_id",[])
+
+        # Initialize counters for metrics
+        action_counts = {
+            'keep': 0,
+            'replace': 0,
+            'upgrade': 0,
+            'degrade': 0,
+            'upgrade_success': 0,  # Actually successfully upgraded
+            'degrade_success': 0   # Actually successfully degraded
+        }
+
+        # We need original problem data - this should be stored in the batch
+        # For now, assume we can reconstruct or access original problems
+        # This might need to be adjusted based on how original problems are stored
+
+        # Phase 1: Collect all generation tasks for batch processing
+        generation_tasks = []  # List of (index, action)
+
+        for i, action in enumerate(actions):
+            if action in ['upgrade', 'degrade']:
+                generation_tasks.append((i, action))
+
+        # Phase 2: Batch generate variants for all upgrade/degrade operations
+        generated_variants = {}  # index -> (action, variant)
+        if generation_tasks:
+            # Unified batch processing for both upgrade and degrade
+            all_problems = []
+            problem_indices = []
+
+            for idx, action in generation_tasks:
+                original_problem_data = dict(self.train_dataset.dataframe[idx])
+                generation_problem = {
+                    'problem': original_problem_data.get('extra_info', {}).get('question', ''),
+                    'answer': original_problem_data.get('extra_info', {}).get('answer', ''),
+                    'action': action 
+                }
+                all_problems.append(generation_problem)
+                problem_indices.append((idx, action))
+
+            # Batch generate all variants at once
+            if all_problems:
+                all_variants = self._generate_problem_variants(all_problems, 1)
+                for i, variant in enumerate(all_variants):
+                    if i < len(problem_indices):
+                        idx, action = problem_indices[i]
+                        generated_variants[idx] = (action, variant)
+
+        # Phase 3: Build final updated_problems list
+        updated_problems = []
+        current_next_id = next_problem_id
+
+        for i, action in enumerate(actions):
+            keep_count = keep_counts[i] if i < len(keep_counts) else 0
+            problem_id = problem_ids[i]
+
+            if action == 'keep':
+                action_counts['keep'] += 1
+                # Keep the original problem - get it from dataset
+                original_problem_data = dict(self.train_dataset.dataframe[problem_id])
+                updated_problems.append({
+                    **original_problem_data,
+                    "action": "keep",
+                    "keep_count": keep_count
+                })
+
+            elif action == 'replace':
+                action_counts['replace'] += 1
+                # Sample a new problem from dataset
+                new_problem = dict(self.train_dataset.dataframe[current_next_id])
+                updated_problems.append({
+                    **new_problem,
+                    "action": "keep",  # Reset action for new problems
+                    "keep_count": 0    # Reset keep_count for new problems
+                })
+                current_next_id += 1
+
+            elif action in ['upgrade', 'degrade']:
+                if action == 'upgrade':
+                    action_counts['upgrade'] += 1
+                else:  # degrade
+                    action_counts['degrade'] += 1
+
+                original_problem_data = dict(self.train_dataset.dataframe[i])
+
+                # Check if we have a generated variant
+                if i in generated_variants:
+                    variant_action, variant = generated_variants[i]
+                    # Update success counter
+                    if variant_action == 'upgrade':
+                        action_counts['upgrade_success'] += 1
+                    else:
+                        action_counts['degrade_success'] += 1
+
+                    # Build updated problem with generated variant
+                    updated_problems.append({
+                        **original_problem_data,
+                        "prompt": [
+                            {
+                                "role": "system",
+                                "content": "Please reason step by step, and put your final answer within \\boxed{{}}.",
+                            },
+                            {
+                                "role": "user",
+                                "content": variant['problem'],
+                            }
+                        ],
+                        "reward_model": {
+                            "style": "rule",
+                            "ground_truth": variant['answer'],
+                        },
+                        "extra_info": {
+                            'split': original_problem_data['extra_info']['split'],
+                            'index': original_problem_data['extra_info']['index'],
+                            'answer': variant['answer'],
+                            "question": variant['problem'],
+                            'level': original_problem_data['extra_info']['level'],
+                        },
+                        "action": "keep",
+                        "keep_count": 0
+                    })
+                else:
+                    # Generation failed - fallback to original
+                    updated_problems.append({
+                        **original_problem_data,
+                        "action": "keep",
+                        "keep_count": 0
+                    })
+
+        return updated_problems, current_next_id, action_counts
+        
+
+    def update_problems_simple(self, train_problems, next_problem_id):
+        """
+        Update all problems with consecutive IDs starting from next_problem_id.
+
+        Args:
+            train_problems: List of problem dictionaries
+            next_problem_id: Starting ID for the problems
+
+        Returns:
+            tuple: (updated_train_problems, new_next_problem_id)
+        """
+        updated_problems = []
+        current_id = next_problem_id
+        
+
+        for problem in train_problems:
+            updated_problem = dict(self.train_dataset.dataframe[current_id])
+            current_id +=1
+            updated_problems.append(updated_problem)
+        return updated_problems, current_id
+
+    def update_action(self, batch: DataProto):
+        """
+        Update actions for prompts based on their reward scores.
+        Actions and keep_count are stored directly in the batch data.
+
+        Args:
+            batch: DataProto containing the batch data with rewards
+        """
+        # Get rewards from batch
+        rewards = batch.batch.get("token_level_rewards", None)
+
+        if rewards is None:
+            return
+
+        # Get action and keep_count from batch (should be in non_tensor_batch)
+        actions = batch.non_tensor_batch.get("action", ["keep"] * len(rewards))
+        keep_counts = batch.non_tensor_batch.get("keep_count", [0] * len(rewards))
+
+        # Calculate average reward for each sample (sum over sequence dimension)
+        reward_sums = rewards.sum(dim=-1)  # (batch_size,)
+        reward_counts = batch.batch["response_mask"].sum(dim=-1)  # (batch_size,)
+        avg_rewards = reward_sums / reward_counts.clamp(min=1)  # Avoid division by zero
+
+        upgrade_threshold = getattr(self.config.data, 'upgrade_threshold', 0.8)
+        degrade_threshold = getattr(self.config.data, 'degrade_threshold', -0.2)
+        keep_max = getattr(self.config.data, 'keep_max', 5)
+
+        updated_actions = []
+        updated_keep_counts = []
+
+        for i in range(len(avg_rewards)):
+            current_reward = avg_rewards[i].item()
+            current_action = actions[i] if i < len(actions) else "keep"
+            current_keep_count = keep_counts[i] if i < len(keep_counts) else 0
+
+            # Update action based on current reward
+            if current_reward > upgrade_threshold:
+                new_action = 'upgrade'
+                new_keep_count = 0
+            elif current_reward < degrade_threshold:
+                new_action = 'degrade'
+                new_keep_count = 0
+            else:
+                # Keep action
+                new_keep_count = current_keep_count + 1
+                if new_keep_count >= keep_max:
+                    new_action = 'replace'
+                else:
+                    new_action = 'keep'
+
+            updated_actions.append(new_action)
+            updated_keep_counts.append(new_keep_count)
+
+        # Update the batch with new actions and keep_counts
+        batch.non_tensor_batch["action"] = np.array(updated_actions, dtype=object)
+        batch.non_tensor_batch["keep_count"] = np.array(updated_keep_counts, dtype=object)
+
+    def _generate_problem_variants(self, original_problems, num_variations_per_problem=4):
+        """
+        Generate problem variants using LLM (upgrade/degrade logic).
+
+        Args:
+            original_problems: List of dicts with 'problem', 'answer', and 'action'
+            num_variations_per_problem: Number of variants per problem
+
+        Returns:
+            List of dicts with 'problem' and 'answer' keys
         """
         import torch
         from verl import DataProto
         from tensordict import TensorDict
-        import numpy as np
         import json
 
         # Create prompts for each original problem
@@ -451,7 +709,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         for problem_data in original_problems:
             problem = problem_data['problem']
             answer = problem_data['answer']
-            label = problem_data['difficulty_label']
+            label = problem_data.get('action', 'upgrade')  # Default to upgrade
 
             if label == 'upgrade':
                 # Create prompt to make the problem harder
@@ -459,16 +717,20 @@ class RayDAPOTrainer(RayPPOTrainer):
 Keep the core concept the same but increase the complexity, add more constraints, or require deeper understanding.
 
 Input:
+```json
 {{
 "problem": "{problem}",
 "answer": "{answer}"
 }}
+```
 
 Generate a harder version and output in the same JSON format:
+```json
 {{
 "problem": "your harder problem here",
 "answer": "corresponding answer here"
 }}
+```
 """
             elif label == 'downgrade':
                 # Create prompt to make the problem easier
@@ -476,22 +738,27 @@ Generate a harder version and output in the same JSON format:
 Keep the core concept the same but reduce the complexity, simplify the requirements, or make it more straightforward.
 
 Input:
+```json
 {{
 "problem": "{problem}",
 "answer": "{answer}"
 }}
-
+```
 Generate an easier version and output in the same JSON format:
+```json
 {{
 "problem": "your easier problem here",
 "answer": "corresponding answer here"
 }}
-
-Output:"""
+```
+"""
             else:
-                raise ValueError(f"Invalid difficulty_label: {label}. Must be 'upgrade' or 'downgrade'")
+                continue  # Skip unknown labels
 
             prompts.append(prompt)
+
+        if not prompts:
+            return []
 
         # Repeat each prompt M times
         repeated_prompts = []
@@ -523,7 +790,7 @@ Output:"""
             },
             meta_info={
                 "do_sample": True,
-                "temperature": 0.8,  # Add some creativity for problem generation
+                "temperature": 0.8,
                 "max_new_tokens": 512,
                 "min_new_tokens": 50,
             }
@@ -533,7 +800,7 @@ Output:"""
         generated_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
         # Extract the generated text
-        generated_sequences = generated_output.batch["input_ids"]  # This includes both prompt and generated text
+        generated_sequences = generated_output.batch["input_ids"]
         attention_masks = generated_output.batch["attention_mask"]
 
         new_problems = []
@@ -564,39 +831,16 @@ Output:"""
                             'answer': parsed_data['answer']
                         }
             except (json.JSONDecodeError, KeyError, TypeError):
-                # If JSON parsing fails, try to extract manually
                 pass
 
             # If JSON parsing succeeded, use the parsed data
             if parsed_problem:
                 new_problems.append(parsed_problem)
             else:
-                # Fallback: use the raw text as problem, set answer as empty
-                # This handles cases where JSON parsing failed
+                # Fallback
                 new_problems.append({
                     'problem': generated_text,
                     'answer': ''
                 })
 
         return new_problems
-
-    def update_problems_simple(self, train_problems, next_problem_id):
-        """
-        Update all problems with consecutive IDs starting from next_problem_id.
-
-        Args:
-            train_problems: List of problem dictionaries
-            next_problem_id: Starting ID for the problems
-
-        Returns:
-            tuple: (updated_train_problems, new_next_problem_id)
-        """
-        updated_problems = []
-        current_id = next_problem_id
-        
-
-        for problem in train_problems:
-            updated_problem = dict(self.train_dataset.dataframe[current_id])
-            current_id +=1
-            updated_problems.append(updated_problem)
-        return updated_problems, current_id
