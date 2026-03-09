@@ -860,12 +860,14 @@ Generate an easier version and output in the same JSON format:
             },
             meta_info={
                 "do_sample": True,
-                "temperature": 0.8,
-                "max_new_tokens": 512,
-                "min_new_tokens": 50,
+                "temperature": self.config.actor_rollout_ref.rollout.temperature,
+                "top_p": self.config.actor_rollout_ref.rollout.top_p,
+                "top_k": self.config.actor_rollout_ref.rollout.get("top_k", -1),
+                "max_new_tokens": self.config.data.max_response_length,
             }
         )
-
+        pprint(f"[_generate_problem_variants] Generating {len(repeated_prompts)} variants "
+               f"({len(prompts)} problems x {num_variations_per_problem} variations)")        
         # Generate new problems using the policy model
         generated_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
@@ -875,6 +877,7 @@ Generate an easier version and output in the same JSON format:
 
         new_problems = []
         batch_size = len(repeated_prompts)
+        parse_success_count = 0
 
         for i in range(batch_size):
             # Find where the prompt ends and generation begins
@@ -906,11 +909,23 @@ Generate an easier version and output in the same JSON format:
             # If JSON parsing succeeded, use the parsed data
             if parsed_problem:
                 new_problems.append(parsed_problem)
+                parse_success_count += 1
             else:
                 # Fallback
                 new_problems.append({
                     'problem': generated_text,
                     'answer': ''
                 })
+            # Log the first case as an example
+            if i == 0:
+                pprint(f"[_generate_problem_variants] === Example Case (index 0) ===")
+                pprint(f"  [PROMPT]\n{repeated_prompts[0]}")
+                pprint(f"  [OUTPUT]\n{generated_text}")
+                if parsed_problem:
+                    pprint(f"  [PARSED] problem: {parsed_problem['problem'][:200]}")
+                    pprint(f"  [PARSED] answer: {parsed_problem['answer'][:200]}")
+                else:
+                    pprint(f"  [PARSED] FAILED - falling back to raw text")
 
+        pprint(f"[_generate_problem_variants] Done: {parse_success_count}/{batch_size} successfully parsed")
         return new_problems
