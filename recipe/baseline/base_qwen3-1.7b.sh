@@ -10,7 +10,7 @@ tensor_model_parallel_size=4
 
 reward_model_name="TIGER-Lab/general-verifier"
 
-epoch=1000
+epoch=1000000
 project_name='semi-self'
 
 lr_warmup_steps=0

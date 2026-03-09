@@ -111,7 +111,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
-            logger.log(data={"info/msg": "Initial validation metrics", **val_metrics}, step=self.global_steps, backend=["console"])
+            pprint(f"Initial validation metrics:{val_metrics}")
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -211,7 +211,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 logger.log(data=metrics, step=self.global_steps)
 
                 if is_last_step:
-                    logger.log(data={"info/msg": "Final validation metrics", **last_val_metrics}, step=self.global_steps, backend=["console"])
+                    pprint(f"Final validation metrics:{last_val_metrics}")
                     progress_bar.close()
                     return
 
@@ -802,7 +802,7 @@ Generate a harder version and output in the same JSON format:
 }}
 ```
 """
-            elif label == 'downgrade':
+            elif label == 'degrade':
                 # Create prompt to make the problem easier
                 prompt = f"""You are given a problem in JSON format. Create a simpler version of this problem.
 Keep the core concept the same but reduce the complexity, simplify the requirements, or make it more straightforward.
@@ -866,9 +866,7 @@ Generate an easier version and output in the same JSON format:
                 "max_new_tokens": self.config.data.max_response_length,
             }
         )
-        self.tracking_logger.log(data={
-            "gen_variants/msg": f"Generating {len(repeated_prompts)} variants ({len(prompts)} problems x {num_variations_per_problem} variations)",
-        }, step=self.global_steps, backend=["console"])
+        pprint(f"Generating {len(repeated_prompts)} variants ({len(prompts)} problems x {num_variations_per_problem} variations)")
         # Generate new problems using the policy model
         generated_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
@@ -919,19 +917,12 @@ Generate an easier version and output in the same JSON format:
                 })
             # Log the first case as an example
             if i == 0:
-                example_data = {
-                    "gen_variants/prompt": repeated_prompts[0],
-                    "gen_variants/output": generated_text,
-                }
+                pprint(f"[generate prompt]: {repeated_prompts[0]}")
+                pprint(f"[generate output]: {generated_text}")
                 if parsed_problem:
-                    example_data["gen_variants/parsed_problem"] = parsed_problem['problem'][:200]
-                    example_data["gen_variants/parsed_answer"] = parsed_problem['answer'][:200]
+                    pprint(f"[parsed problem]: {parsed_problem['problem']}")
+                    pprint(f"[parsed answer]: {parsed_problem['answer']}")
                 else:
-                    example_data["gen_variants/parsed_status"] = "FAILED - falling back to raw text"
-                self.tracking_logger.log(data=example_data, step=self.global_steps, backend=["console"])
-
-        self.tracking_logger.log(data={
-            "gen_variants/parse_success": parse_success_count,
-            "gen_variants/batch_size": batch_size,
-        }, step=self.global_steps, backend=["console"])
+                    pprint("FAILED - falling back to raw text")
+        pprint(f"parse success:{parse_success_count},batch_size:{batch_size}")
         return new_problems
