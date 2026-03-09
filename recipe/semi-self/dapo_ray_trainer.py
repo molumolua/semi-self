@@ -520,7 +520,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 generation_problem = {
                     'problem': original_problem_data.get('extra_info', {}).get('question', ''),
                     'answer': original_problem_data.get('extra_info', {}).get('answer', ''),
-                    'difficulty_label': action
+                    'action': action
                     }
                 all_problems.append(generation_problem)
                 problem_indices.append((uid, action))
@@ -533,17 +533,21 @@ class RayDAPOTrainer(RayPPOTrainer):
                         uid, action = problem_indices[i]
                         generated_variants[uid] = (action, variant)
 
-        # Phase 3: Build final updated_problems list
+        # Phase 3: Build final updated_problems list (one per unique uid)
         updated_problems = []
         current_next_id = next_problem_id
 
-        for i, action in enumerate(actions):
-            keep_count = keep_counts[i] if i < len(keep_counts) else 0
-            problem_id = problem_ids[i]
+        # Build uid -> problem_id mapping
+        uid_to_problem_id = {}
+        for i, uid in enumerate(uids):
+            if uid not in uid_to_problem_id and i < len(problem_ids):
+                uid_to_problem_id[uid] = problem_ids[i]
+
+        for uid, action in uid_to_action.items():
+            keep_count = uid_to_keep_count.get(uid, 0)
+            problem_id = uid_to_problem_id.get(uid, 0)
 
             if action == 'keep':
-                action_counts['keep'] += 1
-                # Keep the original problem - get it from dataset
                 original_problem_data = dict(self.train_dataset.dataframe[problem_id])
                 updated_problems.append({
                     **original_problem_data,
@@ -552,34 +556,24 @@ class RayDAPOTrainer(RayPPOTrainer):
                 })
 
             elif action == 'replace':
-                action_counts['replace'] += 1
-                # Sample a new problem from dataset
                 new_problem = dict(self.train_dataset.dataframe[current_next_id])
                 updated_problems.append({
                     **new_problem,
-                    "action": "keep",  # Reset action for new problems
-                    "keep_count": 0    # Reset keep_count for new problems
+                    "action": "keep",
+                    "keep_count": 0
                 })
                 current_next_id += 1
 
             elif action in ['upgrade', 'degrade']:
-                if action == 'upgrade':
-                    action_counts['upgrade'] += 1
-                else:  # degrade
-                    action_counts['degrade'] += 1
+                original_problem_data = dict(self.train_dataset.dataframe[problem_id])
 
-                original_problem_data = dict(self.train_dataset.dataframe[i])
-
-                # Check if we have a generated variant
-                if i in generated_variants:
-                    variant_action, variant = generated_variants[i]
-                    # Update success counter
+                if uid in generated_variants:
+                    variant_action, variant = generated_variants[uid]
                     if variant_action == 'upgrade':
                         action_counts['upgrade_success'] += 1
                     else:
                         action_counts['degrade_success'] += 1
 
-                    # Build updated problem with generated variant
                     updated_problems.append({
                         **original_problem_data,
                         "prompt": [
@@ -607,7 +601,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                         "keep_count": 0
                     })
                 else:
-                    # Generation failed - fallback to original
                     updated_problems.append({
                         **original_problem_data,
                         "action": "keep",
@@ -710,7 +703,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 new_keep_count = 0
             else:
                 # Keep action
-                if new_keep_count >= keep_max:
+                if current_keep_count >= keep_max:
                     new_keep_count = 0
                     new_action = 'replace'
                 else:
@@ -741,8 +734,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         assert len(batch_updated_actions) == len(uids), f"Action length mismatch: {len(batch_updated_actions)} vs {len(uids)}"
         assert len(batch_updated_keep_counts) == len(uids), f"Keep count length mismatch: {len(batch_updated_keep_counts)} vs {len(uids)}"
 
-        batch.non_tensor_batch["action"] = np.array(batch_updated_actions, dtype=object) * self.config.actor_rollout_ref.rollout.n
-        batch.non_tensor_batch["keep_count"] = np.array(batch_updated_keep_counts, dtype=object) * self.config.actor_rollout_ref.rollout.n
+        batch.non_tensor_batch["action"] = np.array(batch_updated_actions, dtype=object)
+        batch.non_tensor_batch["keep_count"] = np.array(batch_updated_keep_counts, dtype=object)
 
     def _generate_problem_variants(self, original_problems, num_variations_per_problem=4):
         """
