@@ -140,21 +140,21 @@ class RayDAPOTrainer(RayPPOTrainer):
         num_prompt_in_batch = 0
         
         # TODO: 当难度出现反复时，
-        # self.all_train_object =[]
-        # for item in self.train_dataset.dataframe:
-        #     self.all_train_object.append({
-        #         "level":0,
-        #         "dict":{
-        #             0:item
-        #             }
-        #         })
+        self.all_train_object =[]
+        for item in self.train_dataset.dataframe:
+            self.all_train_object.append({
+                "level":0,
+                "dict":{
+                    0:item
+                    }
+                })
         # Get train problems directly from the raw dataframe (not processed data)
         # since InMemoryRLHFDataset expects raw data with 'prompt' field
         train_problems = []
         for i in range(min(self.config.data.train_batch_size, len(self.train_dataset))):
             # Get raw data from dataframe, not processed data from __getitem__
             problem = dict(self.train_dataset.dataframe[i])
-            train_problems.append({**problem,"action":"keep","keep_count":0,"problem_id":i})
+            train_problems.append({**problem,"action":"keep","keep_count":0,"problem_id":i,"level":0})
 
 
         inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
@@ -251,7 +251,12 @@ class RayDAPOTrainer(RayPPOTrainer):
             metrics = {f"timing/{k}": v for k, v in timing_raw.items()}
             logger.log(data=metrics, step=self.global_steps)
 
-    
+    def get_item_from_all_train(self,problem_id):
+        object = self.all_train_object[problem_id]
+        return object['dict'][object['level']]
+    def update_item_for_all_train(self,problem_id,level,item):
+        self.all_train_object[problem_id]['dict'][level]=item
+
     def train_batch(self, batch_dict, prev_step_profile, curr_step_profile,  timing_raw):
         metrics = {}
 
@@ -466,6 +471,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         actions = batch.non_tensor_batch.get("action", [])
         keep_counts = batch.non_tensor_batch.get("keep_count", [])
         problem_ids = batch.non_tensor_batch.get("problem_id",[])
+        levels = batch.non_tensor_batch.get("level",[])
 
         # Initialize counters for metrics
         action_counts = {
@@ -481,12 +487,14 @@ class RayDAPOTrainer(RayPPOTrainer):
         uid_to_action = {}
         uid_to_keep_count = {}
         uid_to_problem_id = {}
+        uid_to_level = {}
 
         for i, uid in enumerate(uids):
             if uid not in uid_to_action:
                 uid_to_action[uid] = actions[i] if i < len(actions) else "keep"
                 uid_to_keep_count[uid] = keep_counts[i] if i < len(keep_counts) else 0
                 uid_to_problem_id[uid] = problem_ids[i]
+                uid_to_level[uid] =levels[i]
 
         # Update counters based on unique uids
         for action in uid_to_action.values():
@@ -520,7 +528,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
             for uid, action in generation_tasks:
                 problem_id = uid_to_problem_id.get(uid, 0)
-                original_problem_data = dict(self.train_dataset.dataframe[problem_id])
+                original_problem_data = self.get_item_from_all_train(problem_id)
                 generation_problem = {
                     'problem': original_problem_data.get('extra_info', {}).get('question', ''),
                     'answer': original_problem_data.get('extra_info', {}).get('answer', ''),
@@ -546,35 +554,42 @@ class RayDAPOTrainer(RayPPOTrainer):
         for uid, action in uid_to_action.items():
             keep_count = uid_to_keep_count.get(uid, 0)
             problem_id = uid_to_problem_id.get(uid, 0)
+            level = uid_to_level.get(uid,0)
 
             if action == 'keep':
-                original_problem_data = dict(self.train_dataset.dataframe[problem_id])
+                original_problem_data = self.get_item_from_all_train(problem_id)
                 updated_problems.append({
                     **original_problem_data,
                     "action": "keep",
-                    "keep_count": keep_count
+                    "keep_count": keep_count,
+                    "problem_id":problem_id,
+                    "level":level
                 })
 
             elif action == 'replace':
-                new_problem = dict(self.train_dataset.dataframe[current_next_id])
+                new_problem = self.get_item_from_all_train(current_next_id)
                 updated_problems.append({
                     **new_problem,
                     "action": "keep",
-                    "keep_count": 0
+                    "keep_count": 0,
+                    "problem_id":problem_id,
+                    "level":0
                 })
                 current_next_id += 1
 
             elif action in ['upgrade', 'degrade']:
-                original_problem_data = dict(self.train_dataset.dataframe[problem_id])
+                original_problem_data = self.get_item_from_all_train(problem_id)
 
                 if uid in generated_variants:
                     variant_action, variant = generated_variants[uid]
+                    new_level=level
                     if variant_action == 'upgrade':
                         action_counts['upgrade_success'] += 1
+                        new_level+=1
                     else:
                         action_counts['degrade_success'] += 1
-
-                    updated_problems.append({
+                        new_level-=1
+                    new_item ={
                         **original_problem_data,
                         "prompt": [
                             {
@@ -598,13 +613,19 @@ class RayDAPOTrainer(RayPPOTrainer):
                             'level': original_problem_data['extra_info']['level'],
                         },
                         "action": "keep",
-                        "keep_count": 0
-                    })
+                        "keep_count": 0,
+                        "problem_id":problem_id,
+                        "level":new_level
+                    }
+                    self.update_item_for_all_train(problem_id,level,new_item)
+                    updated_problems.append(new_item)
                 else:
                     updated_problems.append({
                         **original_problem_data,
                         "action": "keep",
-                        "keep_count": 0
+                        "keep_count": 0,
+                        "problem_id":problem_id,
+                        "level":level
                     })
 
         return updated_problems, current_next_id, action_counts
