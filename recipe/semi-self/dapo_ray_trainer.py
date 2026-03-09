@@ -16,11 +16,14 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import logging
 import os
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
+
+py_logger = logging.getLogger(__name__)
 
 import numpy as np
 import torch
@@ -110,7 +113,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
-            print(f"Initial validation metrics: {val_metrics}")
+            py_logger.info(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
@@ -211,7 +214,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 logger.log(data=metrics, step=self.global_steps)
 
                 if is_last_step:
-                    print(f"Final validation metrics: {last_val_metrics}")
+                    py_logger.info(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
 
@@ -866,7 +869,7 @@ Generate an easier version and output in the same JSON format:
                 "max_new_tokens": self.config.data.max_response_length,
             }
         )
-        print(f"[_generate_problem_variants] Generating {len(repeated_prompts)} variants "
+        py_logger.info(f"[_generate_problem_variants] Generating {len(repeated_prompts)} variants "
                f"({len(prompts)} problems x {num_variations_per_problem} variations)")        
         # Generate new problems using the policy model
         generated_output = self.actor_rollout_wg.generate_sequences(gen_batch)
@@ -918,14 +921,14 @@ Generate an easier version and output in the same JSON format:
                 })
             # Log the first case as an example
             if i == 0:
-                print(f"[_generate_problem_variants] === Example Case (index 0) ===")
-                print(f"  [PROMPT]\n{repeated_prompts[0]}")
-                print(f"  [OUTPUT]\n{generated_text}")
+                py_logger.info(f"[_generate_problem_variants] === Example Case (index 0) ===")
+                py_logger.info(f"  [PROMPT]\n{repeated_prompts[0]}")
+                py_logger.info(f"  [OUTPUT]\n{generated_text}")
                 if parsed_problem:
-                    print(f"  [PARSED] problem: {parsed_problem['problem'][:200]}")
-                    print(f"  [PARSED] answer: {parsed_problem['answer'][:200]}")
+                    py_logger.info(f"  [PARSED] problem: {parsed_problem['problem'][:200]}")
+                    py_logger.info(f"  [PARSED] answer: {parsed_problem['answer'][:200]}")
                 else:
-                    print(f"  [PARSED] FAILED - falling back to raw text")
+                    py_logger.info(f"  [PARSED] FAILED - falling back to raw text")
 
-        print(f"[_generate_problem_variants] Done: {parse_success_count}/{batch_size} successfully parsed")
+        py_logger.info(f"[_generate_problem_variants] Done: {parse_success_count}/{batch_size} successfully parsed")
         return new_problems
