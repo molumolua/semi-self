@@ -110,7 +110,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
+            print(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
@@ -211,7 +211,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 logger.log(data=metrics, step=self.global_steps)
 
                 if is_last_step:
-                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    print(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
 
@@ -866,7 +866,7 @@ Generate an easier version and output in the same JSON format:
                 "max_new_tokens": self.config.data.max_response_length,
             }
         )
-        pprint(f"[_generate_problem_variants] Generating {len(repeated_prompts)} variants "
+        print(f"[_generate_problem_variants] Generating {len(repeated_prompts)} variants "
                f"({len(prompts)} problems x {num_variations_per_problem} variations)")        
         # Generate new problems using the policy model
         generated_output = self.actor_rollout_wg.generate_sequences(gen_batch)
@@ -918,14 +918,14 @@ Generate an easier version and output in the same JSON format:
                 })
             # Log the first case as an example
             if i == 0:
-                pprint(f"[_generate_problem_variants] === Example Case (index 0) ===")
-                pprint(f"  [PROMPT]\n{repeated_prompts[0]}")
-                pprint(f"  [OUTPUT]\n{generated_text}")
+                print(f"[_generate_problem_variants] === Example Case (index 0) ===")
+                print(f"  [PROMPT]\n{repeated_prompts[0]}")
+                print(f"  [OUTPUT]\n{generated_text}")
                 if parsed_problem:
-                    pprint(f"  [PARSED] problem: {parsed_problem['problem'][:200]}")
-                    pprint(f"  [PARSED] answer: {parsed_problem['answer'][:200]}")
+                    print(f"  [PARSED] problem: {parsed_problem['problem'][:200]}")
+                    print(f"  [PARSED] answer: {parsed_problem['answer'][:200]}")
                 else:
-                    pprint(f"  [PARSED] FAILED - falling back to raw text")
+                    print(f"  [PARSED] FAILED - falling back to raw text")
 
-        pprint(f"[_generate_problem_variants] Done: {parse_success_count}/{batch_size} successfully parsed")
+        print(f"[_generate_problem_variants] Done: {parse_success_count}/{batch_size} successfully parsed")
         return new_problems
