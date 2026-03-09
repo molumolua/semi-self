@@ -26,7 +26,7 @@ import torch
 def concat_dict_to_str(dict: dict, step):
     output = [f"step:{step}"]
     for k, v in dict.items():
-        if isinstance(v, numbers.Number):
+        if isinstance(v, (numbers.Number, str)):
             output.append(f"{k}:{pprint.pformat(v)}")
     output_str = " - ".join(output)
     return output_str

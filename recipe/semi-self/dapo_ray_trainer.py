@@ -16,14 +16,11 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import logging
 import os
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
-
-py_logger = logging.getLogger(__name__)
 
 import numpy as np
 import torch
@@ -100,6 +97,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+        self.tracking_logger = logger
 
         self.global_steps = 0
         self.gen_steps = 0
@@ -113,8 +111,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
-            py_logger.info(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            logger.log(data={"info/msg": "Initial validation metrics", **val_metrics}, step=self.global_steps, backend=["console"])
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -214,7 +211,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 logger.log(data=metrics, step=self.global_steps)
 
                 if is_last_step:
-                    py_logger.info(f"Final validation metrics: {last_val_metrics}")
+                    logger.log(data={"info/msg": "Final validation metrics", **last_val_metrics}, step=self.global_steps, backend=["console"])
                     progress_bar.close()
                     return
 
@@ -869,8 +866,9 @@ Generate an easier version and output in the same JSON format:
                 "max_new_tokens": self.config.data.max_response_length,
             }
         )
-        py_logger.info(f"[_generate_problem_variants] Generating {len(repeated_prompts)} variants "
-               f"({len(prompts)} problems x {num_variations_per_problem} variations)")        
+        self.tracking_logger.log(data={
+            "gen_variants/msg": f"Generating {len(repeated_prompts)} variants ({len(prompts)} problems x {num_variations_per_problem} variations)",
+        }, step=self.global_steps, backend=["console"])
         # Generate new problems using the policy model
         generated_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
@@ -921,14 +919,19 @@ Generate an easier version and output in the same JSON format:
                 })
             # Log the first case as an example
             if i == 0:
-                py_logger.info(f"[_generate_problem_variants] === Example Case (index 0) ===")
-                py_logger.info(f"  [PROMPT]\n{repeated_prompts[0]}")
-                py_logger.info(f"  [OUTPUT]\n{generated_text}")
+                example_data = {
+                    "gen_variants/prompt": repeated_prompts[0],
+                    "gen_variants/output": generated_text,
+                }
                 if parsed_problem:
-                    py_logger.info(f"  [PARSED] problem: {parsed_problem['problem'][:200]}")
-                    py_logger.info(f"  [PARSED] answer: {parsed_problem['answer'][:200]}")
+                    example_data["gen_variants/parsed_problem"] = parsed_problem['problem'][:200]
+                    example_data["gen_variants/parsed_answer"] = parsed_problem['answer'][:200]
                 else:
-                    py_logger.info(f"  [PARSED] FAILED - falling back to raw text")
+                    example_data["gen_variants/parsed_status"] = "FAILED - falling back to raw text"
+                self.tracking_logger.log(data=example_data, step=self.global_steps, backend=["console"])
 
-        py_logger.info(f"[_generate_problem_variants] Done: {parse_success_count}/{batch_size} successfully parsed")
+        self.tracking_logger.log(data={
+            "gen_variants/parse_success": parse_success_count,
+            "gen_variants/batch_size": batch_size,
+        }, step=self.global_steps, backend=["console"])
         return new_problems
