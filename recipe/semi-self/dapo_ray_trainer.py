@@ -480,11 +480,13 @@ class RayDAPOTrainer(RayPPOTrainer):
         # Aggregate actions by uid (since batch contains multiple rollouts per prompt)
         uid_to_action = {}
         uid_to_keep_count = {}
+        uid_to_problem_id = {}
 
         for i, uid in enumerate(uids):
             if uid not in uid_to_action:
                 uid_to_action[uid] = actions[i] if i < len(actions) else "keep"
                 uid_to_keep_count[uid] = keep_counts[i] if i < len(keep_counts) else 0
+                uid_to_problem_id[uid] = problem_ids[i]
 
         # Update counters based on unique uids
         for action in uid_to_action.values():
@@ -514,9 +516,11 @@ class RayDAPOTrainer(RayPPOTrainer):
             # Unified batch processing for both upgrade and degrade
             all_problems = []
             problem_indices = []
+            
 
             for uid, action in generation_tasks:
-                original_problem_data = dict(self.train_dataset.dataframe[int(uid)])
+                problem_id = uid_to_problem_id.get(uid, 0)
+                original_problem_data = dict(self.train_dataset.dataframe[problem_id])
                 generation_problem = {
                     'problem': original_problem_data.get('extra_info', {}).get('question', ''),
                     'answer': original_problem_data.get('extra_info', {}).get('answer', ''),
@@ -537,11 +541,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         updated_problems = []
         current_next_id = next_problem_id
 
-        # Build uid -> problem_id mapping
-        uid_to_problem_id = {}
-        for i, uid in enumerate(uids):
-            if uid not in uid_to_problem_id and i < len(problem_ids):
-                uid_to_problem_id[uid] = problem_ids[i]
+       
 
         for uid, action in uid_to_action.items():
             keep_count = uid_to_keep_count.get(uid, 0)
