@@ -241,7 +241,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 timing_raw = defaultdict(float)
                 with marked_timer("update_problems", timing_raw, "blue"):
-                    train_problems, next_problem_id, action_counts = self.update_problems(mock_batch, next_problem_id)
+                    train_problems, next_problem_id, action_counts = self.update_problems(batch, next_problem_id)
                     inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
 
                 # Log next_problem_id, update_problems timing, and action counts as metrics
@@ -475,7 +475,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         Returns:
             tuple: (updated_problems, new_next_problem_id) - same format as update_problems_simple
         """
-        # Get actions and keep_counts from batch
+        # Get uids, actions and keep_counts from batch
+        uids = batch.non_tensor_batch.get("uid", [])
         actions = batch.non_tensor_batch.get("action", [])
         keep_counts = batch.non_tensor_batch.get("keep_count", [])
         problem_ids = batch.non_tensor_batch.get("problem_id",[])
@@ -490,16 +491,36 @@ class RayDAPOTrainer(RayPPOTrainer):
             'degrade_success': 0   # Actually successfully degraded
         }
 
+        # Aggregate actions by uid (since batch contains multiple rollouts per prompt)
+        uid_to_action = {}
+        uid_to_keep_count = {}
+
+        for i, uid in enumerate(uids):
+            if uid not in uid_to_action:
+                uid_to_action[uid] = actions[i] if i < len(actions) else "keep"
+                uid_to_keep_count[uid] = keep_counts[i] if i < len(keep_counts) else 0
+
+        # Update counters based on unique uids
+        for action in uid_to_action.values():
+            if action == 'upgrade':
+                action_counts['upgrade'] += 1
+            elif action == 'degrade':
+                action_counts['degrade'] += 1
+            elif action == 'replace':
+                action_counts['replace'] += 1
+            elif action == 'keep':
+                action_counts['keep'] += 1
+
         # We need original problem data - this should be stored in the batch
         # For now, assume we can reconstruct or access original problems
         # This might need to be adjusted based on how original problems are stored
 
-        # Phase 1: Collect all generation tasks for batch processing
-        generation_tasks = []  # List of (index, action)
+        # Phase 1: Collect all generation tasks for batch processing (per uid)
+        generation_tasks = []  # List of (uid, action)
 
-        for i, action in enumerate(actions):
+        for uid, action in uid_to_action.items():
             if action in ['upgrade', 'degrade']:
-                generation_tasks.append((i, action))
+                generation_tasks.append((uid, action))
 
         # Phase 2: Batch generate variants for all upgrade/degrade operations
         generated_variants = {}  # index -> (action, variant)
@@ -508,7 +529,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             all_problems = []
             problem_indices = []
 
-            for idx, action in generation_tasks:
+            for uid, action in generation_tasks:
                 original_problem_data = dict(self.train_dataset.dataframe[idx])
                 generation_problem = {
                     'problem': original_problem_data.get('extra_info', {}).get('question', ''),
@@ -516,15 +537,15 @@ class RayDAPOTrainer(RayPPOTrainer):
                     'action': action 
                 }
                 all_problems.append(generation_problem)
-                problem_indices.append((idx, action))
+                problem_indices.append((uid, action))
 
             # Batch generate all variants at once
             if all_problems:
                 all_variants = self._generate_problem_variants(all_problems, 1)
                 for i, variant in enumerate(all_variants):
                     if i < len(problem_indices):
-                        idx, action = problem_indices[i]
-                        generated_variants[idx] = (action, variant)
+                        uid, action = problem_indices[i]
+                        generated_variants[uid] = (action, variant)
 
         # Phase 3: Build final updated_problems list
         updated_problems = []
@@ -635,24 +656,51 @@ class RayDAPOTrainer(RayPPOTrainer):
         """
         Update actions for prompts based on their reward scores.
         Actions and keep_count are stored directly in the batch data.
+        Rewards are aggregated by uid since batch contains multiple rollouts per prompt.
 
         Args:
             batch: DataProto containing the batch data with rewards
         """
         # Get rewards from batch
         rewards = batch.batch.get("token_level_rewards", None)
+        uids = batch.non_tensor_batch.get("uid", [])
 
-        if rewards is None:
+        if rewards is None or len(uids) == 0:
             return
-
-        # Get action and keep_count from batch (should be in non_tensor_batch)
-        actions = batch.non_tensor_batch.get("action", ["keep"] * len(rewards))
-        keep_counts = batch.non_tensor_batch.get("keep_count", [0] * len(rewards))
 
         # Calculate average reward for each sample (sum over sequence dimension)
         reward_sums = rewards.sum(dim=-1)  # (batch_size,)
-        reward_counts = batch.batch["response_mask"].sum(dim=-1)  # (batch_size,)
-        avg_rewards = reward_sums / reward_counts.clamp(min=1)  # Avoid division by zero
+        sample_rewards = reward_sums 
+
+        # Aggregate rewards by uid (each uid corresponds to one original prompt)
+        uid_to_rewards = {}
+        for i, uid in enumerate(uids):
+            if uid not in uid_to_rewards:
+                uid_to_rewards[uid] = []
+            uid_to_rewards[uid].append(sample_rewards[i].item())
+
+        # Calculate average reward per uid
+        uid_to_avg_reward = {}
+        for uid, reward_list in uid_to_rewards.items():
+            uid_to_avg_reward[uid] = sum(reward_list) / len(reward_list)
+
+        # Get current actions and keep_counts (these should be per-uid, not per-sample)
+        # Since batch is expanded, we need to get unique uids and their corresponding actions
+        unique_uids = list(uid_to_avg_reward.keys())
+
+        # For actions and keep_counts, we assume they are stored per-uid
+        # If not available, initialize with defaults
+        current_actions = {}
+        current_keep_counts = {}
+
+        # Try to get existing actions and keep_counts from batch
+        batch_actions = batch.non_tensor_batch.get("action", [])
+        batch_keep_counts = batch.non_tensor_batch.get("keep_count", [])
+
+        # Map existing actions/keep_counts to uids (if available)
+        for i, uid in enumerate(uids[:len(batch_actions)]):
+            current_actions[uid] = batch_actions[i]
+            current_keep_counts[uid] = batch_keep_counts[i] if i < len(batch_keep_counts) else 0
 
         upgrade_threshold = getattr(self.config.data, 'upgrade_threshold', 0.8)
         degrade_threshold = getattr(self.config.data, 'degrade_threshold', -0.2)
@@ -661,32 +709,54 @@ class RayDAPOTrainer(RayPPOTrainer):
         updated_actions = []
         updated_keep_counts = []
 
-        for i in range(len(avg_rewards)):
-            current_reward = avg_rewards[i].item()
-            current_action = actions[i] if i < len(actions) else "keep"
-            current_keep_count = keep_counts[i] if i < len(keep_counts) else 0
+        # Process each unique uid
+        for uid in unique_uids:
+            avg_reward = uid_to_avg_reward[uid]
+            current_action = current_actions.get(uid, "keep")
+            current_keep_count = current_keep_counts.get(uid, 0)
 
-            # Update action based on current reward
-            if current_reward > upgrade_threshold:
+            # Update action based on average reward for this uid
+            if avg_reward > upgrade_threshold:
                 new_action = 'upgrade'
                 new_keep_count = 0
-            elif current_reward < degrade_threshold:
+            elif avg_reward < degrade_threshold:
                 new_action = 'degrade'
                 new_keep_count = 0
             else:
                 # Keep action
-                new_keep_count = current_keep_count + 1
                 if new_keep_count >= keep_max:
+                    new_keep_count = 0
                     new_action = 'replace'
                 else:
+                    new_keep_count = current_keep_count + 1
                     new_action = 'keep'
 
+            # Store per-uid results
             updated_actions.append(new_action)
             updated_keep_counts.append(new_keep_count)
 
-        # Update the batch with new actions and keep_counts
-        batch.non_tensor_batch["action"] = np.array(updated_actions, dtype=object)
-        batch.non_tensor_batch["keep_count"] = np.array(updated_keep_counts, dtype=object)
+        # Update the batch with new actions and keep_counts (per-uid)
+        # Note: Since batch is expanded with multiple samples per uid, we need to
+        # replicate the per-uid actions/keep_counts for all samples of each uid
+        batch_updated_actions = []
+        batch_updated_keep_counts = []
+
+        for uid in uids:
+            if uid in unique_uids:
+                idx = unique_uids.index(uid)
+                batch_updated_actions.append(updated_actions[idx])
+                batch_updated_keep_counts.append(updated_keep_counts[idx])
+            else:
+                # Fallback for uids not in our processing
+                batch_updated_actions.append("keep")
+                batch_updated_keep_counts.append(0)
+
+        # Add assertion to verify dimensions match
+        assert len(batch_updated_actions) == len(uids), f"Action length mismatch: {len(batch_updated_actions)} vs {len(uids)}"
+        assert len(batch_updated_keep_counts) == len(uids), f"Keep count length mismatch: {len(batch_updated_keep_counts)} vs {len(uids)}"
+
+        batch.non_tensor_batch["action"] = np.array(batch_updated_actions, dtype=object) * self.config.actor_rollout_ref.rollout.n
+        batch.non_tensor_batch["keep_count"] = np.array(batch_updated_keep_counts, dtype=object) * self.config.actor_rollout_ref.rollout.n
 
     def _generate_problem_variants(self, original_problems, num_variations_per_problem=4):
         """
