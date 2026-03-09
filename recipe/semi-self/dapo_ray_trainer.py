@@ -207,8 +207,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
                 timing_raw = defaultdict(float)  # clear timing
 
-                batch = None
-
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
@@ -222,27 +220,14 @@ class RayDAPOTrainer(RayPPOTrainer):
                 self.gen_steps += 1
 
                 # update train_problems and inmemory_dataloader
-                # Create a mock batch with actions for update_problems
-                from verl import DataProto
-                import numpy as np
-
-                # Extract actions and keep_counts from current train_problems
-                actions = [p.get('action', 'keep') for p in train_problems]
-                keep_counts = [p.get('keep_count', 0) for p in train_problems]
-
-                # Create a minimal batch structure for update_problems
-                mock_batch = DataProto(
-                    batch={},  # Empty tensor batch
-                    non_tensor_batch={
-                        "action": np.array(actions, dtype=object),
-                        "keep_count": np.array(keep_counts, dtype=object)
-                    }
-                )
-
+                # Use the current batch (which contains uids and updated actions from update_action)
+                # The batch should already have the correct actions and keep_counts from update_action
                 timing_raw = defaultdict(float)
                 with marked_timer("update_problems", timing_raw, "blue"):
-                    train_problems, next_problem_id, action_counts = self.update_problems(batch, next_problem_id)
+                    train_problems, next_problem_id, action_counts = self.update_problems(batch, train_problems, next_problem_id)
                     inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
+
+                batch = None
 
                 # Log next_problem_id, update_problems timing, and action counts as metrics
                 update_metrics = {
@@ -463,17 +448,18 @@ class RayDAPOTrainer(RayPPOTrainer):
             sampler=train_sampler,
         )
         return inmemory_dataloader
-    def update_problems(self, batch, next_problem_id, num_variations_per_problem=4):
+    def update_problems(self, batch, train_problems, next_problem_id, num_variations_per_problem=4):
         """
         Update problems based on actions in the batch.
 
         Args:
-            batch: DataProto batch containing actions and original problem data
+            batch: DataProto batch containing actions aggregated by uid
+            train_problems: Current list of training problems with their states
             next_problem_id: Starting ID for new problems (used for replace action)
             num_variations_per_problem: Number of new problems to generate per original problem (M)
 
         Returns:
-            tuple: (updated_problems, new_next_problem_id) - same format as update_problems_simple
+            tuple: (updated_problems, new_next_problem_id, action_counts) - same format as update_problems_simple
         """
         # Get uids, actions and keep_counts from batch
         uids = batch.non_tensor_batch.get("uid", [])
@@ -530,12 +516,12 @@ class RayDAPOTrainer(RayPPOTrainer):
             problem_indices = []
 
             for uid, action in generation_tasks:
-                original_problem_data = dict(self.train_dataset.dataframe[idx])
+                original_problem_data = dict(self.train_dataset.dataframe[int(uid)])
                 generation_problem = {
                     'problem': original_problem_data.get('extra_info', {}).get('question', ''),
                     'answer': original_problem_data.get('extra_info', {}).get('answer', ''),
-                    'action': action 
-                }
+                    'difficulty_label': action
+                    }
                 all_problems.append(generation_problem)
                 problem_indices.append((uid, action))
 
