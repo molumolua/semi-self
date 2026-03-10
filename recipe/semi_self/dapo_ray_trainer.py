@@ -689,7 +689,8 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # Calculate average reward for each sample (sum over sequence dimension)
         reward_sums = rewards.sum(dim=-1)  # (batch_size,)
-        sample_rewards = reward_sums 
+        # Clamp negative rewards to 0 per sample
+        sample_rewards = reward_sums.clamp(min=0)
 
         # Aggregate rewards by uid (each uid corresponds to one original prompt)
         uid_to_rewards = {}
