@@ -926,7 +926,9 @@ Generate an easier version and output in the same JSON format:
 
         # Extract the generated text
         generated_sequences = generated_output.batch["input_ids"]
-        attention_masks = generated_output.batch["attention_mask"]
+        # Prompt was left-padded; rollout returns [prompt_seq, new_tokens]. Use input sequence length
+        # so we decode only the assistant's reply (after the prompt), not the prompt again.
+        input_seq_len = gen_batch.batch["input_ids"].shape[1]
 
         new_problems = []
         batch_size = len(repeated_prompts)
@@ -935,9 +937,7 @@ Generate an easier version and output in the same JSON format:
         degrade_success_count = 0
 
         for i in range(batch_size):
-            # Find where the prompt ends and generation begins
-            prompt_length = attention_mask[i].sum().item()
-            generated_tokens = generated_sequences[i, prompt_length:]
+            generated_tokens = generated_sequences[i, input_seq_len:]
 
             # Decode the generated text
             generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
