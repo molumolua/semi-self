@@ -539,7 +539,9 @@ class RayDAPOTrainer(RayPPOTrainer):
 
             # Batch generate all variants at once
             if all_problems:
-                all_variants = self._generate_problem_variants(all_problems, 1)
+                all_variants, upgrade_success_count, degrade_success_count = self._generate_problem_variants(all_problems, 1)
+                action_counts['upgrade_success'] = upgrade_success_count
+                action_counts['degrade_success'] = degrade_success_count
                 for i, variant in enumerate(all_variants):
                     if i < len(problem_indices):
                         uid, action = problem_indices[i]
@@ -584,10 +586,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     variant_action, variant = generated_variants[uid]
                     new_level=level
                     if variant_action == 'upgrade':
-                        action_counts['upgrade_success'] += 1
                         new_level+=1
                     else:
-                        action_counts['degrade_success'] += 1
                         new_level-=1
                     new_item ={
                         **original_problem_data,
@@ -767,7 +767,10 @@ class RayDAPOTrainer(RayPPOTrainer):
             num_variations_per_problem: Number of variants per problem
 
         Returns:
-            List of dicts with 'problem' and 'answer' keys
+            tuple: (new_problems, upgrade_success_count, degrade_success_count)
+            - new_problems: List of dicts with 'problem' and 'answer' keys
+            - upgrade_success_count: Number of upgrade variants that were successfully parsed
+            - degrade_success_count: Number of degrade variants that were successfully parsed
         """
         import torch
         from verl import DataProto
@@ -828,7 +831,7 @@ Generate an easier version and output in the same JSON format:
             prompts.append(prompt)
 
         if not prompts:
-            return []
+            return [], 0, 0
 
         # Repeat each prompt M times
         repeated_prompts = []
@@ -877,6 +880,8 @@ Generate an easier version and output in the same JSON format:
         new_problems = []
         batch_size = len(repeated_prompts)
         parse_success_count = 0
+        upgrade_success_count = 0
+        degrade_success_count = 0
 
         for i in range(batch_size):
             # Find where the prompt ends and generation begins
@@ -905,10 +910,17 @@ Generate an easier version and output in the same JSON format:
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
 
-            # If JSON parsing succeeded, use the parsed data
+            # If JSON parsing succeeded, use the parsed data and count by action
             if parsed_problem:
                 new_problems.append(parsed_problem)
                 parse_success_count += 1
+                original_idx = i // num_variations_per_problem
+                if original_idx < len(original_problems):
+                    action = original_problems[original_idx].get('action', 'upgrade')
+                    if action == 'upgrade':
+                        upgrade_success_count += 1
+                    elif action == 'degrade':
+                        degrade_success_count += 1
             else:
                 # Fallback
                 new_problems.append({
@@ -925,4 +937,4 @@ Generate an easier version and output in the same JSON format:
                 else:
                     pprint("FAILED - falling back to raw text")
         pprint(f"parse success:{parse_success_count},batch_size:{batch_size}")
-        return new_problems
+        return new_problems, upgrade_success_count, degrade_success_count
