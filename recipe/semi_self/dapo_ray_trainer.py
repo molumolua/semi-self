@@ -586,46 +586,55 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 if uid in generated_variants:
                     variant_action, variant = generated_variants[uid]
-                    new_level=level
-                    if variant_action == 'upgrade':
-                        new_level+=1
-                    else:
-                        new_level-=1
-                    new_item ={
-                        **original_problem_data,
-                        "prompt": [
-                            {
-                                "role": "system",
-                                "content": "Please reason step by step, and put your final answer within \\boxed{{}}.",
+                    if variant['problem'] and variant['answer']:
+                        new_level=level
+                        if variant_action == 'upgrade':
+                            new_level+=1
+                        else:
+                            new_level-=1
+                        new_item ={
+                            **original_problem_data,
+                            "prompt": [
+                                {
+                                    "role": "system",
+                                    "content": "Please reason step by step, and put your final answer within \\boxed{{}}.",
+                                },
+                                {
+                                    "role": "user",
+                                    "content": variant['problem'],
+                                }
+                            ],
+                            "reward_model": {
+                                "style": "rule",
+                                "ground_truth": variant['answer'],
                             },
-                            {
-                                "role": "user",
-                                "content": variant['problem'],
-                            }
-                        ],
-                        "reward_model": {
-                            "style": "rule",
-                            "ground_truth": variant['answer'],
-                        },
-                        "extra_info": {
-                            'split': original_problem_data['extra_info']['split'],
-                            'index': original_problem_data['extra_info']['index'],
-                            'answer': variant['answer'],
-                            "question": variant['problem'],
-                            'level': original_problem_data['extra_info']['level'],
-                        },
-                        "action": "keep",
-                        "keep_count": 0,
-                        "problem_id":problem_id,
-                        "level":new_level
-                    }
-                    self.update_item_for_all_train(problem_id,level,new_item)
-                    updated_problems.append(new_item)
+                            "extra_info": {
+                                'split': original_problem_data['extra_info']['split'],
+                                'index': original_problem_data['extra_info']['index'],
+                                'answer': variant['answer'],
+                                "question": variant['problem'],
+                                'level': original_problem_data['extra_info']['level'],
+                            },
+                            "action": "keep",
+                            "keep_count": 0,
+                            "problem_id":problem_id,
+                            "level":new_level
+                        }
+                        self.update_item_for_all_train(problem_id,level,new_item)
+                        updated_problems.append(new_item)
+                    else:
+                        updated_problems.append({
+                            **original_problem_data,
+                            "action": "keep",
+                            "keep_count": keep_count,
+                            "problem_id":problem_id,
+                            "level":level
+                        })
                 else:
                     updated_problems.append({
                         **original_problem_data,
                         "action": "keep",
-                        "keep_count": 0,
+                        "keep_count": keep_count,
                         "problem_id":problem_id,
                         "level":level
                     })
@@ -720,10 +729,10 @@ class RayDAPOTrainer(RayPPOTrainer):
             # Update action based on average reward for this uid
             if avg_reward > upgrade_threshold:
                 new_action = 'upgrade'
-                new_keep_count = 0
+                new_keep_count = current_keep_count + 1
             elif avg_reward < degrade_threshold:
                 new_action = 'degrade'
-                new_keep_count = 0
+                new_keep_count = current_keep_count + 1
             else:
                 # Keep action
                 if current_keep_count >= keep_max:
@@ -975,7 +984,7 @@ Generate an easier version and output in the same JSON format:
             else:
                 # Fallback
                 new_problems.append({
-                    'problem': generated_text,
+                    'problem': "",
                     'answer': ''
                 })
             # Log the first case as an example
