@@ -75,7 +75,7 @@ actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 max_num_gen_batches=100
 
-PYTHONUNBUFFERED=1 python3 -m recipe.semi-self.main_dapo \
+PYTHONUNBUFFERED=1 python3 -m recipe.semi_self.main_dapo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
@@ -151,7 +151,7 @@ PYTHONUNBUFFERED=1 python3 -m recipe.semi-self.main_dapo \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
     +trainer.max_actor_ckpt_to_keep=1  \
-    +data_config.custom_cls.path=recipe.semi-self.inmemory_dataset \
+    +data_config.custom_cls.path=recipe.semi_self.inmemory_dataset \
     +data_config.custom_cls.name="InMemoryRLHFDataset" \
     +data.upgrade_threshold=0.8 \
     +data.degrade_threshold=0.2 \
