@@ -44,6 +44,8 @@ from verl.utils.dataset.inmemory_dataset import InMemoryRLHFDataset
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
+import verl.utils.torch_functional as verl_F
+from verl.utils.model import compute_position_id_with_mask
 
 
 
@@ -786,7 +788,9 @@ class RayDAPOTrainer(RayPPOTrainer):
 
             if label == 'upgrade':
                 # Create prompt to make the problem harder
-                prompt = f"""You are given a problem in JSON format. Create a more difficult version of this problem.
+                prompt = [{
+                    "role":"user",
+                    "content":f"""You are given a problem in JSON format. Create a more difficult version of this problem.
 Keep the core concept the same but increase the complexity, add more constraints, or require deeper understanding.
 
 Input:
@@ -804,10 +808,12 @@ Generate a harder version and output in the same JSON format:
 "answer": "corresponding answer here"
 }}
 ```
-"""
+"""}]
             elif label == 'degrade':
                 # Create prompt to make the problem easier
-                prompt = f"""You are given a problem in JSON format. Create a simpler version of this problem.
+                prompt = [{
+                    "role":"user",
+                    "content":f"""You are given a problem in JSON format. Create a simpler version of this problem.
 Keep the core concept the same but reduce the complexity, simplify the requirements, or make it more straightforward.
 
 Input:
@@ -824,7 +830,7 @@ Generate an easier version and output in the same JSON format:
 "answer": "corresponding answer here"
 }}
 ```
-"""
+"""}]
             else:
                 continue  # Skip unknown labels
 
@@ -838,28 +844,71 @@ Generate an easier version and output in the same JSON format:
         for prompt in prompts:
             repeated_prompts.extend([prompt] * num_variations_per_problem)
 
-        # Tokenize prompts
-        tokenized_prompts = self.tokenizer(repeated_prompts, return_tensors='pt', padding=True, truncation=True)
+        # Tokenize prompts using the same pipeline as InMemoryRLHFDataset / RLHFDataset.__getitem__
+        # so that generate_sequences receives identical prompt format to the inmemory_dataloader path.
+        data_cfg = self.config.data
+        apply_kwargs = data_cfg.get("apply_chat_template_kwargs", {})
+        max_prompt_length = data_cfg.get("max_prompt_length", 1024)
+        truncation = data_cfg.get("truncation", "error")
+        pad_token_id = self.tokenizer.pad_token_id
 
-        # Create attention mask
-        attention_mask = tokenized_prompts['attention_mask']
+        input_ids_list = []
+        attention_mask_list = []
+        raw_prompt_ids_list = []
 
-        # Create position ids
-        position_ids = torch.arange(attention_mask.size(1), dtype=torch.long).unsqueeze(0).expand(attention_mask.size(0), -1)
+        for prompt_messages in repeated_prompts:
+            raw_prompt = self.tokenizer.apply_chat_template(
+                prompt_messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                **apply_kwargs,
+            )
+            model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
+            input_ids_list.append(model_inputs["input_ids"])
+            attention_mask_list.append(model_inputs["attention_mask"])
+            raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+            if len(raw_prompt_ids) > max_prompt_length:
+                if truncation == "left":
+                    raw_prompt_ids = raw_prompt_ids[-max_prompt_length:]
+                elif truncation == "right":
+                    raw_prompt_ids = raw_prompt_ids[:max_prompt_length]
+                elif truncation == "middle":
+                    left_half = max_prompt_length // 2
+                    right_half = max_prompt_length - left_half
+                    raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
+                elif truncation == "error":
+                    raise RuntimeError(
+                        f"Prompt length {len(raw_prompt_ids)} is longer than max_prompt_length {max_prompt_length}."
+                    )
+            raw_prompt_ids_list.append(raw_prompt_ids)
 
-        # Create TensorDict batch
-        batch = TensorDict({
-            "input_ids": tokenized_prompts['input_ids'],
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-        }, batch_size=len(repeated_prompts))
+        input_ids = torch.cat(input_ids_list, dim=0)
+        attention_mask = torch.cat(attention_mask_list, dim=0)
+        input_ids, attention_mask = verl_F.postprocess_data(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_length=max_prompt_length,
+            pad_token_id=pad_token_id,
+            left_pad=True,
+            truncation=truncation,
+        )
+        position_ids = compute_position_id_with_mask(attention_mask)
 
-        # Create DataProto
+        batch = TensorDict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=len(repeated_prompts),
+        )
+
         gen_batch = DataProto(
             batch=batch,
             non_tensor_batch={
                 "uid": np.arange(len(repeated_prompts)),
                 "data_source": np.array(["update_problems"] * len(repeated_prompts)),
+                "raw_prompt_ids": np.array(raw_prompt_ids_list, dtype=object),
             },
             meta_info={
                 "do_sample": True,
@@ -867,7 +916,7 @@ Generate an easier version and output in the same JSON format:
                 "top_p": self.config.actor_rollout_ref.rollout.top_p,
                 "top_k": self.config.actor_rollout_ref.rollout.get("top_k", -1),
                 "max_new_tokens": self.config.data.max_response_length,
-            }
+            },
         )
         pprint(f"Generating {len(repeated_prompts)} variants ({len(prompts)} problems x {num_variations_per_problem} variations)")
         # Generate new problems using the policy model
