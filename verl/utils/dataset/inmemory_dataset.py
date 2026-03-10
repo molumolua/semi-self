@@ -29,6 +29,50 @@ from verl.utils.model import compute_position_id_with_mask
 logger = logging.getLogger(__name__)
 
 
+def _normalize_row_for_arrow(row: dict) -> dict:
+    """
+    Force string type for problem/answer and nested text fields so PyArrow
+    does not infer int64 (or other wrong types) when building the Dataset.
+    """
+    row = dict(row)
+    # Top-level text fields
+    for key in ("problem", "answer", "question"):
+        if key in row and row[key] is not None:
+            row[key] = str(row[key])
+        elif key in row:
+            row[key] = ""
+    # extra_info: question, answer (and any other text that might be mixed type)
+    if "extra_info" in row and isinstance(row["extra_info"], dict):
+        ei = dict(row["extra_info"])
+        for key in ("question", "answer", "split"):
+            if key in ei and ei[key] is not None:
+                ei[key] = str(ei[key])
+            elif key in ei:
+                ei[key] = ""
+        row["extra_info"] = ei
+    # reward_model.ground_truth
+    if "reward_model" in row and isinstance(row["reward_model"], dict):
+        rm = dict(row["reward_model"])
+        if "ground_truth" in rm and rm["ground_truth"] is not None:
+            rm["ground_truth"] = str(rm["ground_truth"])
+        elif "ground_truth" in rm:
+            rm["ground_truth"] = ""
+        row["reward_model"] = rm
+    # prompt: ensure each message content is str when it's scalar (avoid list/multimodal)
+    if "prompt" in row and isinstance(row["prompt"], list):
+        def _ensure_content_str(msg):
+            if not isinstance(msg, dict) or "content" not in msg:
+                return msg
+            c = msg["content"]
+            if c is None:
+                return {**msg, "content": ""}
+            if isinstance(c, (list, dict)):
+                return msg  # leave multimodal content as-is
+            return {**msg, "content": str(c)}
+        row["prompt"] = [_ensure_content_str(msg) for msg in row["prompt"]]
+    return row
+
+
 class InMemoryRLHFDataset(RLHFDataset):
     def __init__(
         self,
@@ -85,8 +129,10 @@ class InMemoryRLHFDataset(RLHFDataset):
 
         
     def get_dataframe(self):
-        
-        self.dataframe=HFDataset.from_list(self.data_list)
+        # Normalize so problem/answer and nested text fields are always str;
+        # avoids PyArrow inferring int64 and failing when later rows have string values.
+        normalized_list = [_normalize_row_for_arrow(row) for row in self.data_list]
+        self.dataframe = HFDataset.from_list(normalized_list)
         print(f"dataset len: {len(self.dataframe)}")
 
         # filter out too long prompts
