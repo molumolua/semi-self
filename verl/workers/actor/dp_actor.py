@@ -362,6 +362,14 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
+        # Optional: scale loss so that update with actual batch size K has same effect as reference batch size T
+        equivalence_scale = 1.0
+        if getattr(self.config, "normalize_update_by_reference_batch_size", False):
+            actual = data.meta_info.get("actual_global_batch_size")
+            reference = data.meta_info.get("reference_batch_size")
+            if actual is not None and reference is not None and reference > 0:
+                equivalence_scale = actual / reference
+
         select_keys = [
             "responses",
             "response_mask",
@@ -481,17 +489,17 @@ class DataParallelPPOActor(BasePPOActor):
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
+                        micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor * equivalence_scale
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
-                        loss = policy_loss * loss_scale_factor
+                        loss = policy_loss * loss_scale_factor * equivalence_scale
                     else:
-                        loss = policy_loss * loss_scale_factor
+                        loss = policy_loss * loss_scale_factor * equivalence_scale
                     loss.backward()
 
-                    micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
+                    micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor * equivalence_scale
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()

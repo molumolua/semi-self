@@ -423,6 +423,14 @@ class RayDAPOTrainer(RayPPOTrainer):
             if self.config.trainer.critic_warmup <= self.global_steps:
                 # update actor
                 with marked_timer("update_actor", timing_raw, "red"):
+                    # For normalize_update_by_reference_batch_size: so K-sample update matches T-sample effect
+                    batch.meta_info["actual_global_batch_size"] = batch.batch["attention_mask"].shape[0]
+                    batch.meta_info["reference_batch_size"] = (
+                        self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+                    )
+                    # 也把这两个信息打到 metrics 里，方便在 logger 中查看
+                    metrics["train/actual_global_batch_size"] = batch.meta_info["actual_global_batch_size"]
+                    metrics["train/reference_batch_size"] = batch.meta_info["reference_batch_size"]
                     actor_output = self.actor_rollout_wg.update_actor(batch)
                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                 metrics.update(actor_output_metrics)

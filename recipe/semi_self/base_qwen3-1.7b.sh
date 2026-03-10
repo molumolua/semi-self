@@ -156,4 +156,5 @@ PYTHONUNBUFFERED=1 python3 -m recipe.semi_self.main_dapo \
     +data.upgrade_threshold=0.8 \
     +data.degrade_threshold=0.2 \
     +data.keep_max=1 \
+    +actor_rollout_ref.actor.normalize_update_by_reference_batch_size=true
 

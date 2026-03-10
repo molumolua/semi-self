@@ -81,6 +81,9 @@ class ActorConfig(BaseConfig):
         checkpoint (CheckpointConfig): Configuration for checkpointing.
         optim (OptimizerConfig): Configuration for optimizer.
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
+        normalize_update_by_reference_batch_size (bool): If True, scale policy loss so that an update
+            with actual_global_batch_size samples has the same effect as one with reference_batch_size
+            (both passed in data.meta_info by the trainer). Used when batch size varies (e.g. K vs standard).
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {
@@ -88,6 +91,7 @@ class ActorConfig(BaseConfig):
         "ppo_micro_batch_size",
         "ppo_micro_batch_size_per_gpu",
         "ppo_infer_micro_batch_size_per_gpu",
+        "normalize_update_by_reference_batch_size",
     }
 
     strategy: str = MISSING
@@ -115,6 +119,7 @@ class ActorConfig(BaseConfig):
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
+    normalize_update_by_reference_batch_size: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     engine: BaseConfig = field(default_factory=BaseConfig)
     data_loader_seed = 1
