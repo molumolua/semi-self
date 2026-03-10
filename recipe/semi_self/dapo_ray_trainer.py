@@ -864,8 +864,18 @@ Generate an easier version and output in the same JSON format:
                 **apply_kwargs,
             )
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
-            input_ids_list.append(model_inputs["input_ids"])
-            attention_mask_list.append(model_inputs["attention_mask"])
+            ids = model_inputs["input_ids"]
+            mask = model_inputs["attention_mask"]
+            ids, mask = verl_F.postprocess_data(
+                input_ids=ids,
+                attention_mask=mask,
+                max_length=max_prompt_length,
+                pad_token_id=pad_token_id,
+                left_pad=True,
+                truncation=truncation,
+            )
+            input_ids_list.append(ids)
+            attention_mask_list.append(mask)
             raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
             if len(raw_prompt_ids) > max_prompt_length:
                 if truncation == "left":
@@ -884,14 +894,6 @@ Generate an easier version and output in the same JSON format:
 
         input_ids = torch.cat(input_ids_list, dim=0)
         attention_mask = torch.cat(attention_mask_list, dim=0)
-        input_ids, attention_mask = verl_F.postprocess_data(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_length=max_prompt_length,
-            pad_token_id=pad_token_id,
-            left_pad=True,
-            truncation=truncation,
-        )
         position_ids = compute_position_id_with_mask(attention_mask)
 
         batch = TensorDict(
