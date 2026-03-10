@@ -735,7 +735,10 @@ class RayDAPOTrainer(RayPPOTrainer):
             current_keep_count = current_keep_counts.get(uid, 0)
 
             # Update action based on average reward for this uid
-            if avg_reward > upgrade_threshold:
+            if current_keep_count >= keep_max:
+                    new_keep_count = 0
+                    new_action = 'replace'
+            elif avg_reward > upgrade_threshold:
                 new_action = 'upgrade'
                 new_keep_count = current_keep_count + 1
             elif avg_reward < degrade_threshold:
@@ -743,12 +746,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                 new_keep_count = current_keep_count + 1
             else:
                 # Keep action
-                if current_keep_count >= keep_max:
-                    new_keep_count = 0
-                    new_action = 'replace'
-                else:
-                    new_keep_count = current_keep_count + 1
-                    new_action = 'keep'
+                new_keep_count = current_keep_count + 1
+                new_action = 'keep'
 
             # Store per-uid results
             updated_actions.append(new_action)
