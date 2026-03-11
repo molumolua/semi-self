@@ -139,6 +139,8 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         timing_raw = defaultdict(float)
         batch = None
+        original_batch=None
+        added_batch = None
         num_prompt_in_batch = 0
         
         # TODO: 当难度出现反复时，
@@ -169,7 +171,13 @@ class RayDAPOTrainer(RayPPOTrainer):
             # only one batch for InMemoryRLHFDataset
             for batch_dict in inmemory_dataloader:
                 is_last_step = self.global_steps >= self.total_training_steps
-                batch,metrics= self.train_batch(batch_dict,prev_step_profile,curr_step_profile,timing_raw)
+                original_batch, added_batch, metrics = self.train_batch(batch_dict, prev_step_profile, curr_step_profile, timing_raw)
+                # Combined batch for metrics (original + added)
+                batch = (
+                    DataProto.concat([original_batch, added_batch])
+                    if added_batch is not None and original_batch is not None
+                    else (original_batch if original_batch is not None else added_batch)
+                )
                 # validate
                 if (
                     self.val_reward_fn is not None
@@ -227,7 +235,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                 # The batch should already have the correct actions and keep_counts from update_action
                 timing_raw = defaultdict(float)
                 with marked_timer("update_problems", timing_raw, "blue"):
-                    train_problems, next_problem_id, action_counts, generated_samples, pending_generated_batch = self.update_problems(batch, train_problems, next_problem_id)
+                    # original_batch 有一些是updated_problems,这些updated_problems如果不管控，那么batch_sizeh会越来越大。
+                    train_problems, next_problem_id, action_counts, generated_samples, pending_generated_batch = self.update_problems(original_batch, train_problems, next_problem_id)
                     self.pending_generated_samples = generated_samples
                     self.pending_generated_batch = pending_generated_batch
                     inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
@@ -418,10 +427,21 @@ class RayDAPOTrainer(RayPPOTrainer):
                         for k in new_batch.non_tensor_batch.keys():
                             if k not in added_batch.non_tensor_batch:
                                 added_batch.non_tensor_batch[k] = np.array([None] * len(keep_indices), dtype=object)
+                        # Mark source so we can split original vs added at return
+                        n_orig = new_batch.batch["attention_mask"].shape[0]
+                        new_batch.non_tensor_batch["_batch_source"] = np.array(["original"] * n_orig, dtype=object)
+                        added_batch.non_tensor_batch["_batch_source"] = np.array(["added"] * len(keep_indices), dtype=object)
                         new_batch = DataProto.concat([new_batch, added_batch])
+                    
+                    self.pending_generated_batch = None
+                    self.pending_samples = None
 
             if not self.config.algorithm.filter_groups.enable:
                 batch = new_batch
+                if "_batch_source" not in batch.non_tensor_batch:
+                    batch.non_tensor_batch["_batch_source"] = np.array(
+                        ["original"] * batch.batch["attention_mask"].shape[0], dtype=object
+                    )
             else:
                 raise NotImplementedError("Filter groups are not supported for semi-self.")
                             
@@ -496,8 +516,42 @@ class RayDAPOTrainer(RayPPOTrainer):
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
             if rollout_data_dir:
                 self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-            
-            return batch,metrics
+
+            # Split batch into original and added (from pending generated) for separate return
+            src = batch.non_tensor_batch.get("_batch_source", None)
+            if src is not None:
+                src = np.asarray(src)
+                orig_idx = np.where(src == "original")[0]
+                add_idx = np.where(src == "added")[0]
+                device = batch.batch["attention_mask"].device
+                if len(orig_idx) > 0:
+                    o_idx = torch.tensor(orig_idx, dtype=torch.long, device=device)
+                    orig_batch = {
+                        k: v.index_select(0, o_idx) for k, v in batch.batch.items()
+                    }
+                    orig_non = {k: np.array(v)[orig_idx] for k, v in batch.non_tensor_batch.items() if k != "_batch_source"}
+                    original_batch = DataProto(batch=orig_batch, non_tensor_batch=orig_non, meta_info=dict(batch.meta_info))
+                else:
+                    original_batch = None
+                if len(add_idx) > 0:
+                    a_idx = torch.tensor(add_idx, dtype=torch.long, device=device)
+                    add_batch = {
+                        k: v.index_select(0, a_idx) for k, v in batch.batch.items()
+                    }
+                    add_non = {k: np.array(v)[add_idx] for k, v in batch.non_tensor_batch.items() if k != "_batch_source"}
+                    added_batch = DataProto(batch=add_batch, non_tensor_batch=add_non, meta_info=dict(batch.meta_info))
+                else:
+                    added_batch = None
+            else:
+                original_batch = batch
+                added_batch = None
+
+            if original_batch is not None and "_batch_source" in original_batch.non_tensor_batch:
+                original_batch.non_tensor_batch.pop("_batch_source", None)
+            if added_batch is not None and "_batch_source" in added_batch.non_tensor_batch:
+                added_batch.non_tensor_batch.pop("_batch_source", None)
+
+            return original_batch, added_batch, metrics
         
     def createInmemoryDataLoader(self,train_problems):
         train_dataset = InMemoryRLHFDataset(
@@ -513,7 +567,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         num_workers = self.config.data["dataloader_num_workers"]
         inmemory_dataloader=StatefulDataLoader(
             dataset=train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            batch_size=len(train_problems),
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
@@ -537,10 +591,42 @@ class RayDAPOTrainer(RayPPOTrainer):
         """
         # Get uids, actions and keep_counts from batch
         uids = batch.non_tensor_batch.get("uid", [])
+        uids = np.asarray(uids) if not isinstance(uids, np.ndarray) else uids
         actions = batch.non_tensor_batch.get("action", [])
         keep_counts = batch.non_tensor_batch.get("keep_count", [])
-        problem_ids = batch.non_tensor_batch.get("problem_id",[])
-        levels = batch.non_tensor_batch.get("level",[])
+        problem_ids = batch.non_tensor_batch.get("problem_id", [])
+        levels = batch.non_tensor_batch.get("level", [])
+        uid_to_avg_reward = batch.meta_info.get("uid_to_avg_reward") or batch.non_tensor_batch.get("uid_to_avg_reward") or {}
+        # Phase 0: Cleanup uids by data_source — keep all for "general_reasoner", else keep only highest-reward uid per gen
+        data_sources = batch.non_tensor_batch.get("data_source", None)
+        if data_sources is not None:
+            data_sources = np.asarray(data_sources)
+        else:
+            data_sources = np.array(["general_reasoner"] * len(uids), dtype=object)
+
+        data_source_to_uids = {}
+        for i in range(len(uids)):
+            ds = data_sources[i] if i < len(data_sources) else "general_reasoner"
+            if ds is None or (isinstance(ds, str) and str(ds).strip() == ""):
+                ds = "general_reasoner"
+            ds = str(ds)
+            if ds not in data_source_to_uids:
+                data_source_to_uids[ds] = []
+            data_source_to_uids[ds].append(uids[i])
+
+        keep_uids = set()
+        for ds, uid_list in data_source_to_uids.items():
+            unique_uids = list(dict.fromkeys(uid_list))
+            if ds == "general_reasoner":
+                keep_uids.update(unique_uids)
+            else:
+                best_uid = max(
+                    unique_uids,
+                    key=lambda u:  1-2*abs(uid_to_avg_reward.get(u,0.0)-0.5),
+                )
+                keep_uids.add(best_uid)
+        uids = keep_uids
+
 
         # Initialize counters for metrics
         action_counts = {
@@ -607,15 +693,18 @@ class RayDAPOTrainer(RayPPOTrainer):
                 all_problems.append(generation_problem)
                 problem_indices.append((uid, action))
 
-            # Batch generate all variants at once
+            # Batch generate all variants at once (each prompt -> N variants in all_variants)
             if all_problems:
                 all_variants, upgrade_success_count, degrade_success_count, generated_output, parse_success_list = self._generate_problem_variants(all_problems, num_variations_per_problem)
                 action_counts['upgrade_success'] = upgrade_success_count
                 action_counts['degrade_success'] = degrade_success_count
-                for i, variant in enumerate(all_variants):
-                    if i < len(problem_indices):
-                        uid, action = problem_indices[i]
-                        generated_variants[uid] = (action, variant)
+                num_prompts = len(problem_indices)
+                for p in range(num_prompts):
+                    uid, action = problem_indices[p]
+                    start = p * num_variations_per_problem
+                    end = start + num_variations_per_problem
+                    # All N variants for this (uid, action)
+                    generated_variants[uid] = [(action, v) for v in all_variants[start:end]]
 
         # Build generated_samples and pending_generated_batch for RL reward in next train_batch
         generated_samples = []
@@ -637,10 +726,14 @@ class RayDAPOTrainer(RayPPOTrainer):
 
        
 
+       
+
+       
+
         for uid, action in uid_to_action.items():
             keep_count = uid_to_keep_count.get(uid, 0)
             problem_id = uid_to_problem_id.get(uid, 0)
-            level = uid_to_level.get(uid,0)
+            level = uid_to_level.get(uid, 0)
 
             if action == 'keep':
                 original_problem_data = self.get_item_from_all_train(problem_id)
@@ -667,60 +760,66 @@ class RayDAPOTrainer(RayPPOTrainer):
                 original_problem_data = self.get_item_from_all_train(problem_id)
 
                 if uid in generated_variants:
-                    variant_action, variant = generated_variants[uid]
-                    if variant['problem'] and variant['answer']:
-                        new_level=level
-                        if variant_action == 'upgrade':
-                            new_level+=1
-                        else:
-                            new_level-=1
-                        new_item ={
-                            **original_problem_data,
-                            "prompt": [
-                                {
-                                    "role": "system",
-                                    "content": "Please reason step by step, and put your final answer within \\boxed{{}}.",
-                                },
-                                {
-                                    "role": "user",
-                                    "content": variant['problem'],
+                    # Pick first valid variant from the N variants for this prompt
+                    variant_action, variant = None, None
+                    for va, v in generated_variants[uid]:
+                        if v.get('problem') and v.get('answer'):
+                            variant_action, variant = va, v
+                            if variant_action is not None and variant and variant['problem'] and variant['answer']:
+                                new_level = level
+                                if variant_action == 'upgrade':
+                                    new_level += 1
+                                else:
+                                    new_level -= 1
+                                new_item = {
+                                    **original_problem_data,
+                                    "prompt": [
+                                        {
+                                            "role": "system",
+                                            "content": "Please reason step by step, and put your final answer within \\boxed{{}}.",
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": variant['problem'],
+                                        }
+                                    ],
+                                    "reward_model": {
+                                        "style": "rule",
+                                        "ground_truth": variant['answer'],
+                                    },
+                                    "extra_info": {
+                                        'split': original_problem_data['extra_info']['split'],
+                                        'index': original_problem_data['extra_info']['index'],
+                                        'answer': variant['answer'],
+                                        "question": variant['problem'],
+                                        'level': original_problem_data['extra_info']['level'],
+                                    },
+                                    "action": "keep",
+                                    "keep_count": 0,
+                                    "problem_id": problem_id,
+                                    "level": new_level,
+                                    "data_source": variant['uid'],
                                 }
-                            ],
-                            "reward_model": {
-                                "style": "rule",
-                                "ground_truth": variant['answer'],
-                            },
-                            "extra_info": {
-                                'split': original_problem_data['extra_info']['split'],
-                                'index': original_problem_data['extra_info']['index'],
-                                'answer': variant['answer'],
-                                "question": variant['problem'],
-                                'level': original_problem_data['extra_info']['level'],
-                            },
-                            "action": "keep",
-                            "keep_count": 0,
-                            "problem_id":problem_id,
-                            "level":new_level
-                        }
-                        new_item["from_generation_uid"] = str(uid)
-                        self.update_item_for_all_train(problem_id,level,new_item)
-                        updated_problems.append(new_item)
-                    else:
-                        updated_problems.append({
-                            **original_problem_data,
-                            "action": "keep",
-                            "keep_count": keep_count,
-                            "problem_id":problem_id,
-                            "level":level
-                        })
-                else:
-                    updated_problems.append({
-                        **original_problem_data,
-                        "action": "keep",
-                        "keep_count": keep_count,
-                        "problem_id":problem_id,
-                        "level":level
-                    })
+                                new_item["from_generation_uid"] = str(uid)
+                                self.update_item_for_all_train(problem_id,level,new_item)
+                                updated_problems.append(new_item)
+                            else:
+                                updated_problems.append({
+                                    **original_problem_data,
+                                    "action": "keep",
+                                    "keep_count": keep_count,
+                                    "problem_id":problem_id,
+                                    "level":level
+                                })
+                        else:
+                            updated_problems.append({
+                                **original_problem_data,
+                                "action": "keep",
+                                "keep_count": keep_count,
+                                "problem_id":problem_id,
+                                "level":level
+                            })
+
 
         return updated_problems, current_next_id, action_counts, generated_samples, pending_generated_batch
         
@@ -774,10 +873,15 @@ class RayDAPOTrainer(RayPPOTrainer):
                 uid_to_rewards[uid] = []
             uid_to_rewards[uid].append(sample_rewards[i].item())
 
+
         # Calculate average reward per uid
         uid_to_avg_reward = {}
         for uid, reward_list in uid_to_rewards.items():
             uid_to_avg_reward[uid] = sum(reward_list) / len(reward_list)
+
+
+        # Store for Phase 0 in update_problems (cleanup by data_source)
+        batch.meta_info["uid_to_avg_reward"] = uid_to_avg_reward  # also in meta_info so it survives batch split
 
         # Get current actions and keep_counts (these should be per-uid, not per-sample)
         # Since batch is expanded, we need to get unique uids and their corresponding actions
@@ -1054,9 +1158,11 @@ Generate an easier version and output in the same JSON format:
 
                     # Extract problem and answer
                     if parsed_data and 'problem' in parsed_data and 'answer' in parsed_data:
+                        uid_i = gen_batch.non_tensor_batch["uid"][i]
                         parsed_problem = {
                             'problem': parsed_data['problem'],
-                            'answer': parsed_data['answer']
+                            'answer': parsed_data['answer'],
+                            'uid': uid_i,
                         }
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
@@ -1076,9 +1182,11 @@ Generate an easier version and output in the same JSON format:
                         degrade_success_count += 1
             else:
                 # Fallback
+                uid_i = gen_batch.non_tensor_batch["uid"][i]
                 new_problems.append({
                     'problem': "",
-                    'answer': ''
+                    'answer': '',
+                    'uid': uid_i,
                 })
             # Log the first case as an example
             if i == 0:
