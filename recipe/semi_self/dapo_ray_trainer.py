@@ -744,7 +744,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     "action": "keep",
                     "keep_count": keep_count,
                     "problem_id":problem_id,
-                    "level":level
+                    "level":level,
+                    "data_source":"general_reasoner"
                 })
 
             elif action == 'replace':
@@ -754,7 +755,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     "action": "keep",
                     "keep_count": 0,
                     "problem_id":problem_id,
-                    "level":0
+                    "level":0,
+                    "data_source":"general_reasoner"
                 })
                 current_next_id += 1
 
@@ -811,7 +813,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                                     "action": "keep",
                                     "keep_count": keep_count,
                                     "problem_id":problem_id,
-                                    "level":level
+                                    "level":level,
+                                    "data_source":"general_reasoner"
                                 })
                         else:
                             updated_problems.append({
@@ -819,7 +822,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 "action": "keep",
                                 "keep_count": keep_count,
                                 "problem_id":problem_id,
-                                "level":level
+                                "level":level,
+                                "data_source":"general_reasoner"
                             })
 
 
