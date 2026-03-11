@@ -409,7 +409,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             if gen_uid not in from_generation_uid_to_acc:
                                 continue
                             acc = from_generation_uid_to_acc[gen_uid]
-                            r_gen = 1.0 - 2.0 * (acc - 0.5)
+                            r_gen = 1.0 - 2.0 * abs(acc - 0.5)
                         keep_indices.append(i)
                         last_pos = int(pending_batch.batch["attention_mask"][i].sum().item() - 1)
                         r_vec = torch.zeros(seq_len, device=device, dtype=torch.float32)
