@@ -814,7 +814,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                     "keep_count": keep_count,
                                     "problem_id":problem_id,
                                     "level":level,
-                                    "data_source":"general_reasoner"
+                                    "data_source": variant['uid'],
                                 })
                         else:
                             updated_problems.append({
@@ -823,7 +823,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 "keep_count": keep_count,
                                 "problem_id":problem_id,
                                 "level":level,
-                                "data_source":"general_reasoner"
+                                "data_source": variant['uid'],
                             })
 
 
