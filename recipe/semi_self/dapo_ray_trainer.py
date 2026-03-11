@@ -162,7 +162,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
 
         next_problem_id = self.config.data.train_batch_size
-
+        self.pending_generated_samples = []
+        self.pending_generated_batch = None
 
         for epoch in range(self.config.trainer.total_epochs):
             # only one batch for InMemoryRLHFDataset
@@ -226,7 +227,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                 # The batch should already have the correct actions and keep_counts from update_action
                 timing_raw = defaultdict(float)
                 with marked_timer("update_problems", timing_raw, "blue"):
-                    train_problems, next_problem_id, action_counts = self.update_problems(batch, train_problems, next_problem_id)
+                    train_problems, next_problem_id, action_counts, generated_samples, pending_generated_batch = self.update_problems(batch, train_problems, next_problem_id)
+                    self.pending_generated_samples = generated_samples
+                    self.pending_generated_batch = pending_generated_batch
                     inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
 
                 batch = None
@@ -363,6 +366,60 @@ class RayDAPOTrainer(RayPPOTrainer):
             # Update actions based on reward scores
             self.update_action(new_batch)
 
+            # Compute from_generation_uid -> average reward (acc) for samples from generated problems (for gen-step reward)
+            from_generation_uid_to_acc = {}
+            rewards = new_batch.batch.get("token_level_rewards", None)
+            from_generation_uids = new_batch.non_tensor_batch.get("from_generation_uid", None)
+            if rewards is not None and from_generation_uids is not None:
+                reward_sums = rewards.sum(dim=-1)
+                uid_to_rewards = {}
+                for i in range(len(from_generation_uids)):
+                    gid = from_generation_uids[i]
+                    if gid is not None and str(gid).strip() != "":
+                        gid = str(gid)
+                        uid_to_rewards.setdefault(gid, []).append(reward_sums[i].item())
+                for gid, r_list in uid_to_rewards.items():
+                    from_generation_uid_to_acc[gid] = sum(r_list) / len(r_list)
+
+            # Merge pending generated batch (from previous step's upgrade/degrade) with rewards for PPO
+            if getattr(self, "pending_generated_batch", None) is not None and getattr(self, "pending_generated_samples", None):
+                pending_batch = self.pending_generated_batch
+                pending_samples = self.pending_generated_samples
+                if len(pending_samples) > 0 and pending_batch.batch["attention_mask"].shape[0] == len(pending_samples):
+                    device = pending_batch.batch["attention_mask"].device
+                    dtype = pending_batch.batch["attention_mask"].dtype
+                    seq_len = pending_batch.batch["attention_mask"].shape[1]
+                    token_level_rewards_list = []
+                    keep_indices = []
+                    for i, info in enumerate(pending_samples):
+                        gen_uid = info["gen_uid"]
+                        parsed_success = info["parsed_success"]
+                        if not parsed_success:
+                            r_gen = -0.5
+                        else:
+                            if gen_uid not in from_generation_uid_to_acc:
+                                continue
+                            acc = from_generation_uid_to_acc[gen_uid]
+                            r_gen = 1.0 - 2.0 * (acc - 0.5)
+                        keep_indices.append(i)
+                        last_pos = int(pending_batch.batch["attention_mask"][i].sum().item() - 1)
+                        r_vec = torch.zeros(seq_len, device=device, dtype=torch.float32)
+                        if last_pos >= 0:
+                            r_vec[last_pos] = float(r_gen)
+                        token_level_rewards_list.append(r_vec.unsqueeze(0))
+                    if keep_indices:
+                        idx = torch.tensor(keep_indices, dtype=torch.long, device=device)
+                        sub_batch = {k: v.index_select(0, idx) for k, v in pending_batch.batch.items()}
+                        sub_non_tensor = {k: np.array(v)[keep_indices] for k, v in pending_batch.non_tensor_batch.items()}
+                        token_level_rewards = torch.cat(token_level_rewards_list, dim=0)
+                        sub_batch["token_level_rewards"] = token_level_rewards
+                        added_batch = DataProto(batch=sub_batch, non_tensor_batch=sub_non_tensor, meta_info=dict(pending_batch.meta_info))
+                        added_batch.non_tensor_batch["uid"] = np.array([f"gen_{i}" for i in range(len(keep_indices))], dtype=object)
+                        for k in new_batch.non_tensor_batch.keys():
+                            if k not in added_batch.non_tensor_batch:
+                                added_batch.non_tensor_batch[k] = np.array([None] * len(keep_indices), dtype=object)
+                        new_batch = DataProto.concat([new_batch, added_batch])
+
             if not self.config.algorithm.filter_groups.enable:
                 batch = new_batch
             else:
@@ -474,7 +531,9 @@ class RayDAPOTrainer(RayPPOTrainer):
             num_variations_per_problem: Number of new problems to generate per original problem (M)
 
         Returns:
-            tuple: (updated_problems, new_next_problem_id, action_counts) - same format as update_problems_simple
+            tuple: (updated_problems, new_next_problem_id, action_counts, generated_samples, pending_generated_batch)
+            - generated_samples: list of dicts with gen_uid, problem_id, level, parsed_success (for RL reward in next train_batch)
+            - pending_generated_batch: DataProto from _generate_problem_variants (None if no generation)
         """
         # Get uids, actions and keep_counts from batch
         uids = batch.non_tensor_batch.get("uid", [])
@@ -529,12 +588,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                 generation_tasks.append((uid, action))
 
         # Phase 2: Batch generate variants for all upgrade/degrade operations
-        generated_variants = {}  # index -> (action, variant)
+        generated_variants = {}
+        problem_indices = []
+        generated_output = None
+        parse_success_list = []
         if generation_tasks:
             # Unified batch processing for both upgrade and degrade
             all_problems = []
-            problem_indices = []
-            
 
             for uid, action in generation_tasks:
                 problem_id = uid_to_problem_id.get(uid, 0)
@@ -549,13 +609,27 @@ class RayDAPOTrainer(RayPPOTrainer):
 
             # Batch generate all variants at once
             if all_problems:
-                all_variants, upgrade_success_count, degrade_success_count = self._generate_problem_variants(all_problems, 1)
+                all_variants, upgrade_success_count, degrade_success_count, generated_output, parse_success_list = self._generate_problem_variants(all_problems, num_variations_per_problem)
                 action_counts['upgrade_success'] = upgrade_success_count
                 action_counts['degrade_success'] = degrade_success_count
                 for i, variant in enumerate(all_variants):
                     if i < len(problem_indices):
                         uid, action = problem_indices[i]
                         generated_variants[uid] = (action, variant)
+
+        # Build generated_samples and pending_generated_batch for RL reward in next train_batch
+        generated_samples = []
+        pending_generated_batch = None
+        if generation_tasks and generated_output is not None and parse_success_list:
+            pending_generated_batch = generated_output
+            for i in range(len(problem_indices)):
+                uid, _ = problem_indices[i]
+                generated_samples.append({
+                    "gen_uid": str(uid),
+                    "problem_id": uid_to_problem_id.get(uid, 0),
+                    "level": uid_to_level.get(uid, 0),
+                    "parsed_success": parse_success_list[i] if i < len(parse_success_list) else False,
+                })
 
         # Phase 3: Build final updated_problems list (one per unique uid)
         updated_problems = []
@@ -628,6 +702,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             "problem_id":problem_id,
                             "level":new_level
                         }
+                        new_item["from_generation_uid"] = str(uid)
                         self.update_item_for_all_train(problem_id,level,new_item)
                         updated_problems.append(new_item)
                     else:
@@ -647,7 +722,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                         "level":level
                     })
 
-        return updated_problems, current_next_id, action_counts
+        return updated_problems, current_next_id, action_counts, generated_samples, pending_generated_batch
         
 
     def update_problems_simple(self, train_problems, next_problem_id):
@@ -795,6 +870,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         from verl import DataProto
         from tensordict import TensorDict
         import json
+        import re
 
         # Create prompts for each original problem
         prompts = []
@@ -854,7 +930,7 @@ Generate an easier version and output in the same JSON format:
             prompts.append(prompt)
 
         if not prompts:
-            return [], 0, 0
+            return [], 0, 0, None, []
 
         # Repeat each prompt M times
         repeated_prompts = []
@@ -922,10 +998,17 @@ Generate an easier version and output in the same JSON format:
             batch_size=len(repeated_prompts),
         )
 
+        # One uid per original prompt, repeated for each variation of that prompt
+        num_prompts = len(prompts)
+        uid_per_prompt = [str(uuid.uuid4()) for _ in range(num_prompts)]
+        uid_array = np.array(
+            [uid_per_prompt[i // num_variations_per_problem] for i in range(len(repeated_prompts))],
+            dtype=object,
+        )
         gen_batch = DataProto(
             batch=batch,
             non_tensor_batch={
-                "uid": np.arange(len(repeated_prompts)),
+                "uid": uid_array,
                 "data_source": np.array(["update_problems"] * len(repeated_prompts)),
                 "raw_prompt_ids": np.array(raw_prompt_ids_list, dtype=object),
             },
@@ -952,6 +1035,7 @@ Generate an easier version and output in the same JSON format:
         parse_success_count = 0
         upgrade_success_count = 0
         degrade_success_count = 0
+        parse_success_list = []
 
         for i in range(batch_size):
             generated_tokens = generated_sequences[i, input_seq_len:]
@@ -959,24 +1043,25 @@ Generate an easier version and output in the same JSON format:
             # Decode the generated text
             generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
-            # Try to parse as JSON
+            # Try to parse as JSON: extract content from the last ```json ... ``` block
             parsed_problem = None
             try:
-                # Find JSON in the generated text
-                start_idx = generated_text.find('{')
-                end_idx = generated_text.rfind('}') + 1
-                if start_idx != -1 and end_idx > start_idx:
-                    json_str = generated_text[start_idx:end_idx]
+                json_block_pattern = re.compile(r'```json\s*([\s\S]*?)```')
+                matches = json_block_pattern.findall(generated_text)
+                if matches:
+                    json_str = matches[-1].strip()
                     parsed_data = json.loads(json_str)
 
                     # Extract problem and answer
-                    if 'problem' in parsed_data and 'answer' in parsed_data:
+                    if parsed_data and 'problem' in parsed_data and 'answer' in parsed_data:
                         parsed_problem = {
                             'problem': parsed_data['problem'],
                             'answer': parsed_data['answer']
                         }
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
+
+            parse_success_list.append(parsed_problem is not None)
 
             # If JSON parsing succeeded, use the parsed data and count by action
             if parsed_problem:
@@ -1005,4 +1090,4 @@ Generate an easier version and output in the same JSON format:
                 else:
                     pprint("FAILED - falling back to raw text")
         pprint(f"parse success:{parse_success_count},batch_size:{batch_size}")
-        return new_problems, upgrade_success_count, degrade_success_count
+        return new_problems, upgrade_success_count, degrade_success_count, generated_output, parse_success_list
