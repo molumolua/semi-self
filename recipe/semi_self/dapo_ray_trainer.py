@@ -382,7 +382,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             rewards = new_batch.batch.get("token_level_rewards", None)
             from_generation_uids = new_batch.non_tensor_batch.get("from_generation_uid", None)
             if rewards is not None and from_generation_uids is not None:
-                reward_sums = rewards.sum(dim=-1)
+                reward_sums = rewards.sum(dim=-1).clamp(min=0)
                 uid_to_rewards = {}
                 for i in range(len(from_generation_uids)):
                     gid = from_generation_uids[i]
@@ -437,6 +437,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                     
                     self.pending_generated_batch = None
                     self.pending_samples = None
+                else:
+                    if len(pending_samples) > 0:
+                        raise ValueError(f'{pending_batch.batch["attention_mask"].shape[0]} != {len(pending_samples)}')
 
             if not self.config.algorithm.filter_groups.enable:
                 batch = new_batch
@@ -740,12 +743,13 @@ class RayDAPOTrainer(RayPPOTrainer):
             pending_generated_batch = generated_output
             for i in range(len(problem_indices)):
                 uid, _ = problem_indices[i]
-                generated_samples.append({
-                    "gen_uid": str(uid),
-                    "problem_id": uid_to_problem_id.get(uid, 0),
-                    "level": uid_to_level.get(uid, 0),
-                    "parsed_success": parse_success_list[i] if i < len(parse_success_list) else False,
-                })
+                for n in range(num_variations_per_problem):
+                    generated_samples.append({
+                        "gen_uid": str(uid),
+                        "problem_id": uid_to_problem_id.get(uid, 0),
+                        "level": uid_to_level.get(uid, 0),
+                        "parsed_success": parse_success_list[num_variations_per_problem*i+n] if i < len(parse_success_list) else False,
+                    })
 
         # Phase 3: Build final updated_problems list (one per unique uid)
         updated_problems = []
