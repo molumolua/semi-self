@@ -166,6 +166,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         next_problem_id = self.config.data.train_batch_size
         self.pending_generated_samples = []
         self.pending_generated_batch = None
+        
+        self.pending_super_uid_to_new_item = {}
 
         for epoch in range(self.config.trainer.total_epochs):
             # only one batch for InMemoryRLHFDataset
@@ -598,28 +600,34 @@ class RayDAPOTrainer(RayPPOTrainer):
         keep_counts = batch.non_tensor_batch.get("keep_count", [])
         problem_ids = batch.non_tensor_batch.get("problem_id", [])
         levels = batch.non_tensor_batch.get("level", [])
+        super_uids = batch.non_tensor_batch.get("super_uid", [])
+        
+
+                
+                
         uid_to_avg_reward = batch.meta_info.get("uid_to_avg_reward") or batch.non_tensor_batch.get("uid_to_avg_reward") or {}
-        # Phase 0: Cleanup uids by data_source — keep all for "general_reasoner", else keep only highest-reward uid per gen
+        # Phase 0: Cleanup uids by data_source — keep all for "general-reasoner", else keep only highest-reward uid per gen
         data_sources = batch.non_tensor_batch.get("data_source", None)
         if data_sources is not None:
             data_sources = np.asarray(data_sources)
         else:
-            data_sources = np.array(["general_reasoner"] * len(uids), dtype=object)
+            data_sources = np.array(["general-reasoner"] * len(uids), dtype=object)
 
         data_source_to_uids = {}
         for i in range(len(uids)):
-            ds = data_sources[i] if i < len(data_sources) else "general_reasoner"
+            ds = data_sources[i] if i < len(data_sources) else "general-reasoner"
             if ds is None or (isinstance(ds, str) and str(ds).strip() == ""):
-                ds = "general_reasoner"
+                ds = "general-reasoner"
             ds = str(ds)
             if ds not in data_source_to_uids:
                 data_source_to_uids[ds] = []
             data_source_to_uids[ds].append(uids[i])
 
         keep_uids = set()
+        best_uids = set()
         for ds, uid_list in data_source_to_uids.items():
             unique_uids = list(dict.fromkeys(uid_list))
-            if ds == "general_reasoner":
+            if ds == "general-reasoner":
                 keep_uids.update(unique_uids)
             else:
                 best_uid = max(
@@ -627,7 +635,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     key=lambda u:  1-2*abs(uid_to_avg_reward.get(u,0.0)-0.5),
                 )
                 keep_uids.add(best_uid)
-        uids = keep_uids
+                best_uids.add(best_uid)
+        
 
 
         # Initialize counters for metrics
@@ -640,18 +649,34 @@ class RayDAPOTrainer(RayPPOTrainer):
             'degrade_success': 0   # Actually successfully degraded
         }
 
+       
         # Aggregate actions by uid (since batch contains multiple rollouts per prompt)
         uid_to_action = {}
         uid_to_keep_count = {}
         uid_to_problem_id = {}
         uid_to_level = {}
-
+        uid_to_super_uid ={}
+        
         for i, uid in enumerate(uids):
-            if uid not in uid_to_action:
+            if uid not in uid_to_action and uid in keep_uids:
                 uid_to_action[uid] = actions[i] if i < len(actions) else "keep"
                 uid_to_keep_count[uid] = keep_counts[i] if i < len(keep_counts) else 0
                 uid_to_problem_id[uid] = problem_ids[i]
                 uid_to_level[uid] =levels[i]
+                if len(super_uids) > 0:
+                    uid_to_super_uid[uid]=super_uids[i]
+                
+        uids = keep_uids
+        
+        for uid in best_uids:
+            problem_id = uid_to_problem_id[uid]
+            level = uid_to_level[uid]
+            super_uid = uid_to_super_uid[uid]
+            self.update_item_for_all_train(problem_id,level,self.pending_super_uid_to_new_item[super_uid])
+        
+        self.pending_super_uid_to_new_item = {}
+        
+        
 
         # Update counters based on unique uids
         for action in uid_to_action.values():
@@ -683,7 +708,6 @@ class RayDAPOTrainer(RayPPOTrainer):
         if generation_tasks:
             # Unified batch processing for both upgrade and degrade
             all_problems = []
-
             for uid, action in generation_tasks:
                 problem_id = uid_to_problem_id.get(uid, 0)
                 original_problem_data = self.get_item_from_all_train(problem_id)
@@ -708,6 +732,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # All N variants for this (uid, action)
                     generated_variants[uid] = [(action, v) for v in all_variants[start:end]]
 
+        
         # Build generated_samples and pending_generated_batch for RL reward in next train_batch
         generated_samples = []
         pending_generated_batch = None
@@ -725,12 +750,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         # Phase 3: Build final updated_problems list (one per unique uid)
         updated_problems = []
         current_next_id = next_problem_id
-
-       
-
-       
-
-       
+        
 
         for uid, action in uid_to_action.items():
             keep_count = uid_to_keep_count.get(uid, 0)
@@ -745,7 +765,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     "keep_count": keep_count,
                     "problem_id":problem_id,
                     "level":level,
-                    "data_source":"general_reasoner"
+                    "data_source":"general-reasoner",
+                    "super_uid":"none"
                 })
 
             elif action == 'replace':
@@ -756,7 +777,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     "keep_count": 0,
                     "problem_id":problem_id,
                     "level":0,
-                    "data_source":"general_reasoner"
+                    "data_source":"general-reasoner",
+                    "super_uid":"none"
                 })
                 current_next_id += 1
 
@@ -767,8 +789,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # Pick first valid variant from the N variants for this prompt
                     variant_action, variant = None, None
                     for va, v in generated_variants[uid]:
+                        variant_action, variant = va, v
+                        super_uid = str(uuid.uuid4())
                         if v.get('problem') and v.get('answer'):
-                            variant_action, variant = va, v
                             if variant_action is not None and variant and variant['problem'] and variant['answer']:
                                 new_level = level
                                 if variant_action == 'upgrade':
@@ -803,29 +826,38 @@ class RayDAPOTrainer(RayPPOTrainer):
                                     "problem_id": problem_id,
                                     "level": new_level,
                                     "data_source": variant['uid'],
+                                    "super_uid":super_uid
                                 }
                                 new_item["from_generation_uid"] = str(uid)
-                                self.update_item_for_all_train(problem_id,level,new_item)
                                 updated_problems.append(new_item)
+                                self.pending_super_uid_to_new_item[super_uid]= new_item
                             else:
-                                updated_problems.append({
+                                new_item ={
                                     **original_problem_data,
                                     "action": "keep",
                                     "keep_count": keep_count,
                                     "problem_id":problem_id,
                                     "level":level,
                                     "data_source": variant['uid'],
-                                })
+                                    "super_uid":super_uid
+                                }
+                                updated_problems.append(new_item)
+                                self.pending_super_uid_to_new_item[super_uid]= new_item
                         else:
-                            updated_problems.append({
+                            new_item ={
                                 **original_problem_data,
                                 "action": "keep",
                                 "keep_count": keep_count,
                                 "problem_id":problem_id,
                                 "level":level,
                                 "data_source": variant['uid'],
-                            })
-
+                                "super_uid":super_uid
+                            }
+                            updated_problems.append(new_item)
+                            self.pending_super_uid_to_new_item[super_uid]= new_item
+                        
+                else:
+                    raise ValueError(f"Unexpect error for {original_problem_data}")
 
         return updated_problems, current_next_id, action_counts, generated_samples, pending_generated_batch
         
