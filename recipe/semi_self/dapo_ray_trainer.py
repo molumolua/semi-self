@@ -526,18 +526,20 @@ class RayDAPOTrainer(RayPPOTrainer):
                 device = batch.batch["attention_mask"].device
                 if len(orig_idx) > 0:
                     o_idx = torch.tensor(orig_idx, dtype=torch.long, device=device)
-                    orig_batch = {
+                    orig_batch_dict = {
                         k: v.index_select(0, o_idx) for k, v in batch.batch.items()
                     }
+                    orig_batch = TensorDict(source=orig_batch_dict, batch_size=[len(orig_idx)])
                     orig_non = {k: np.array(v)[orig_idx] for k, v in batch.non_tensor_batch.items() if k != "_batch_source"}
                     original_batch = DataProto(batch=orig_batch, non_tensor_batch=orig_non, meta_info=dict(batch.meta_info))
                 else:
                     original_batch = None
                 if len(add_idx) > 0:
                     a_idx = torch.tensor(add_idx, dtype=torch.long, device=device)
-                    add_batch = {
+                    add_batch_dict = {
                         k: v.index_select(0, a_idx) for k, v in batch.batch.items()
                     }
+                    add_batch = TensorDict(source=add_batch_dict, batch_size=[len(add_idx)])
                     add_non = {k: np.array(v)[add_idx] for k, v in batch.non_tensor_batch.items() if k != "_batch_source"}
                     added_batch = DataProto(batch=add_batch, non_tensor_batch=add_non, meta_info=dict(batch.meta_info))
                 else:
