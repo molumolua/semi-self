@@ -399,7 +399,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                 if len(pending_samples) > 0 and pending_batch.batch["attention_mask"].shape[0] == len(pending_samples):
                     device = pending_batch.batch["attention_mask"].device
                     dtype = pending_batch.batch["attention_mask"].dtype
-                    seq_len = pending_batch.batch["attention_mask"].shape[1]
+                    # Reward-related tensors must be response_length only (match new_batch / fsdp _expand_to_token_level)
+                    response_length = int(pending_batch.batch["responses"].shape[1])
                     token_level_rewards_list = []
                     keep_indices = []
                     for i, info in enumerate(pending_samples):
@@ -413,19 +414,22 @@ class RayDAPOTrainer(RayPPOTrainer):
                             acc = super_uid_to_acc[super_uid]
                             r_gen = 1.0 - 2.0 * abs(acc - 0.5)
                         keep_indices.append(i)
-                        last_pos = int(pending_batch.batch["attention_mask"][i].sum().item() - 1)
-                        r_vec = torch.zeros(seq_len, device=device, dtype=torch.float32)
-                        if last_pos >= 0:
-                            r_vec[last_pos] = float(r_gen)
+                        # Last valid position within response part only (not full sequence)
+                        valid_response_len = int(pending_batch.batch["attention_mask"][i, -response_length:].sum().item())
+                        last_pos_in_response = valid_response_len - 1
+                        r_vec = torch.zeros(response_length, device=device, dtype=torch.float32)
+                        if last_pos_in_response >= 0:
+                            r_vec[last_pos_in_response] = float(r_gen)
                         token_level_rewards_list.append(r_vec.unsqueeze(0))
                     if keep_indices:
                         idx = torch.tensor(keep_indices, dtype=torch.long, device=device)
                         sub_batch = {k: v.index_select(0, idx) for k, v in pending_batch.batch.items()}
                         sub_non_tensor = {k: np.array(v)[keep_indices] for k, v in pending_batch.non_tensor_batch.items()}
                         token_level_rewards = torch.cat(token_level_rewards_list, dim=0)
+                        # Reward tensors: response_length only (same as new_batch / fsdp _expand_to_token_level)
+                        sub_batch["rm_scores"] = token_level_rewards
+                        sub_batch["token_level_scores"] = token_level_rewards
                         sub_batch["token_level_rewards"] = token_level_rewards
-                        sub_batch['token_level_scores'] = token_level_rewards
-                        sub_batch['rm_scores'] = token_level_rewards
                         sub_batch_td = TensorDict(source=sub_batch, batch_size=[len(keep_indices)])
                         added_batch = DataProto(batch=sub_batch_td, non_tensor_batch=sub_non_tensor, meta_info=dict(pending_batch.meta_info))
                         added_batch.non_tensor_batch["uid"] = np.array([f"gen_{i}" for i in range(len(keep_indices))], dtype=object)
