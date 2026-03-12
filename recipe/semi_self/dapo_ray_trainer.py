@@ -424,6 +424,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                         sub_non_tensor = {k: np.array(v)[keep_indices] for k, v in pending_batch.non_tensor_batch.items()}
                         token_level_rewards = torch.cat(token_level_rewards_list, dim=0)
                         sub_batch["token_level_rewards"] = token_level_rewards
+                        sub_batch['token_level_scores'] = token_level_rewards
+                        sub_batch['rm_scores'] = token_level_rewards
                         sub_batch_td = TensorDict(source=sub_batch, batch_size=[len(keep_indices)])
                         added_batch = DataProto(batch=sub_batch_td, non_tensor_batch=sub_non_tensor, meta_info=dict(pending_batch.meta_info))
                         added_batch.non_tensor_batch["uid"] = np.array([f"gen_{i}" for i in range(len(keep_indices))], dtype=object)
