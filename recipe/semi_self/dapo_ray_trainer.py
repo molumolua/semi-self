@@ -377,20 +377,20 @@ class RayDAPOTrainer(RayPPOTrainer):
             # Update actions based on reward scores
             self.update_action(new_batch)
 
-            # Compute from_generation_uid -> average reward (acc) for samples from generated problems (for gen-step reward)
-            from_generation_uid_to_acc = {}
+            # Compute super_uid -> average reward (acc) for samples from generated problems (for gen-step reward)
+            super_uid_to_acc = {}
             rewards = new_batch.batch.get("token_level_rewards", None)
-            from_generation_uids = new_batch.non_tensor_batch.get("from_generation_uid", None)
-            if rewards is not None and from_generation_uids is not None:
+            super_uids = new_batch.non_tensor_batch.get("super_uid", None)
+            if rewards is not None and super_uids is not None:
                 reward_sums = rewards.sum(dim=-1).clamp(min=0)
-                uid_to_rewards = {}
-                for i in range(len(from_generation_uids)):
-                    gid = from_generation_uids[i]
-                    if gid is not None and str(gid).strip() != "":
-                        gid = str(gid)
-                        uid_to_rewards.setdefault(gid, []).append(reward_sums[i].item())
-                for gid, r_list in uid_to_rewards.items():
-                    from_generation_uid_to_acc[gid] = sum(r_list) / len(r_list)
+                super_uid_to_rewards = {}
+                for i in range(len(super_uids)):
+                    sid = super_uids[i]
+                    if sid is not None and str(sid).strip() != "":
+                        sid = str(sid)
+                        super_uid_to_rewards.setdefault(sid, []).append(reward_sums[i].item())
+                for sid, r_list in super_uid_to_rewards.items():
+                    super_uid_to_acc[sid] = sum(r_list) / len(r_list)
 
             # Merge pending generated batch (from previous step's upgrade/degrade) with rewards for PPO
             if getattr(self, "pending_generated_batch", None) is not None and getattr(self, "pending_generated_samples", None):
@@ -403,14 +403,14 @@ class RayDAPOTrainer(RayPPOTrainer):
                     token_level_rewards_list = []
                     keep_indices = []
                     for i, info in enumerate(pending_samples):
-                        gen_uid = info["gen_uid"]
+                        super_uid = info["super_uid"]
                         parsed_success = info["parsed_success"]
                         if not parsed_success:
                             r_gen = -0.5
                         else:
-                            if gen_uid not in from_generation_uid_to_acc:
+                            if super_uid not in super_uid_to_acc:
                                 continue
-                            acc = from_generation_uid_to_acc[gen_uid]
+                            acc = super_uid_to_acc[super_uid]
                             r_gen = 1.0 - 2.0 * abs(acc - 0.5)
                         keep_indices.append(i)
                         last_pos = int(pending_batch.batch["attention_mask"][i].sum().item() - 1)
@@ -424,7 +424,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                         sub_non_tensor = {k: np.array(v)[keep_indices] for k, v in pending_batch.non_tensor_batch.items()}
                         token_level_rewards = torch.cat(token_level_rewards_list, dim=0)
                         sub_batch["token_level_rewards"] = token_level_rewards
-                        added_batch = DataProto(batch=sub_batch, non_tensor_batch=sub_non_tensor, meta_info=dict(pending_batch.meta_info))
+                        sub_batch_td = TensorDict(source=sub_batch, batch_size=[len(keep_indices)])
+                        added_batch = DataProto(batch=sub_batch_td, non_tensor_batch=sub_non_tensor, meta_info=dict(pending_batch.meta_info))
                         added_batch.non_tensor_batch["uid"] = np.array([f"gen_{i}" for i in range(len(keep_indices))], dtype=object)
                         for k in new_batch.non_tensor_batch.keys():
                             if k not in added_batch.non_tensor_batch:
@@ -593,7 +594,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         Returns:
             tuple: (updated_problems, new_next_problem_id, action_counts, generated_samples, pending_generated_batch)
-            - generated_samples: list of dicts with gen_uid, problem_id, level, parsed_success (for RL reward in next train_batch)
+            - generated_samples: list of dicts with super_uid, problem_id, level, parsed_success (for RL reward in next train_batch)
             - pending_generated_batch: DataProto from _generate_problem_variants (None if no generation)
         """
         # Get uids, actions and keep_counts from batch
@@ -736,22 +737,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                     generated_variants[uid] = [(action, v) for v in all_variants[start:end]]
 
         
-        # Build generated_samples and pending_generated_batch for RL reward in next train_batch
-        generated_samples = []
-        pending_generated_batch = None
-        if generation_tasks and generated_output is not None and parse_success_list:
-            pending_generated_batch = generated_output
-            for i in range(len(problem_indices)):
-                uid, _ = problem_indices[i]
-                for n in range(num_variations_per_problem):
-                    generated_samples.append({
-                        "gen_uid": str(uid),
-                        "problem_id": uid_to_problem_id.get(uid, 0),
-                        "level": uid_to_level.get(uid, 0),
-                        "parsed_success": parse_success_list[num_variations_per_problem*i+n] if i < len(parse_success_list) else False,
-                    })
+
 
         # Phase 3: Build final updated_problems list (one per unique uid)
+        # Build generated_samples and pending_generated_batch for RL reward in next train_batch
+        generated_samples = []
         updated_problems = []
         current_next_id = next_problem_id
         
@@ -835,6 +825,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 new_item["from_generation_uid"] = str(uid)
                                 updated_problems.append(new_item)
                                 self.pending_super_uid_to_new_item[super_uid]= new_item
+
+                                generated_samples.append({
+                                    "super_uid": super_uid,
+                                    "problem_id": uid_to_problem_id.get(uid, 0),
+                                    "level": new_level,
+                                    "parsed_success": True,
+                                })
                             else:
                                 new_item ={
                                     **original_problem_data,
@@ -847,6 +844,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 }
                                 updated_problems.append(new_item)
                                 self.pending_super_uid_to_new_item[super_uid]= new_item
+
+                                generated_samples.append({
+                                    "super_uid": super_uid,
+                                    "problem_id": uid_to_problem_id.get(uid, 0),
+                                    "level": level,
+                                    "parsed_success": False,
+                                })
                         else:
                             new_item ={
                                 **original_problem_data,
@@ -859,6 +863,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                             }
                             updated_problems.append(new_item)
                             self.pending_super_uid_to_new_item[super_uid]= new_item
+
+                            generated_samples.append({
+                                "super_uid": super_uid,
+                                "problem_id": uid_to_problem_id.get(uid, 0),
+                                "level": level,
+                                "parsed_success": False,
+                            })
                         
                 else:
                     raise ValueError(f"Unexpect error for {original_problem_data}")
