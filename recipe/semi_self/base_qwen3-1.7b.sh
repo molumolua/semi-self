@@ -2,6 +2,13 @@
 set -euxo pipefail
 export WANDB_MODE=offline
 
+
+normalize_update_by_reference_batch_size=true
+keep_max=1
+generation_train=true
+
+
+
 model_name="Qwen3-1.7B-Base"
 offload=False
 ref_offload=False
@@ -23,7 +30,7 @@ train_prompt_mini_bsz=64
 
 
 
-exp_name=${exp_name:-"backward-update-model-${model_name}-lr-${lr}-bsz-${train_prompt_bsz}-n_resp-${n_resp_per_prompt}-mini-${train_prompt_mini_bsz}"}
+exp_name=${exp_name:-"gt-${generation_train}-normalize-${normalize_update_by_reference_batch_size}-keep-${keep_max}-model-${model_name}-lr-${lr}-bsz-${train_prompt_bsz}-n_resp-${n_resp_per_prompt}-mini-${train_prompt_mini_bsz}"}
 # exp_name=${exp_name:-"None-test-data-True-select-False-batch-size-192-64-64-1-7-0-7-replay-0-entropy_coeff-0-dataset-think-DeepMath-103K-model-Qwen2.5-7B"}
 adv_estimator=grpo
 
@@ -151,10 +158,9 @@ PYTHONUNBUFFERED=1 python3 -m recipe.semi_self.main_dapo \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
     +trainer.max_actor_ckpt_to_keep=1  \
-    +data_config.custom_cls.path=recipe.semi_self.inmemory_dataset \
-    +data_config.custom_cls.name="InMemoryRLHFDataset" \
     +data.upgrade_threshold=0.8 \
     +data.degrade_threshold=0.2 \
-    +data.keep_max=1 \
-    +actor_rollout_ref.actor.normalize_update_by_reference_batch_size=true
+    +data.keep_max=${keep_max} \
+    +actor_rollout_ref.actor.normalize_update_by_reference_batch_size=${normalize_update_by_reference_batch_size}\
+    +trainer.generation_train=${generation_train}
 

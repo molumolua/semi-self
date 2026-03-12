@@ -239,8 +239,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                 with marked_timer("update_problems", timing_raw, "blue"):
                     # original_batch 有一些是updated_problems,这些updated_problems如果不管控，那么batch_sizeh会越来越大。
                     train_problems, next_problem_id, action_counts, generated_samples, pending_generated_batch = self.update_problems(original_batch, train_problems, next_problem_id)
-                    self.pending_generated_samples = generated_samples
-                    self.pending_generated_batch = pending_generated_batch
+                    if self.config.trainer.get("generation_train",False):
+                        self.pending_generated_samples = generated_samples
+                        self.pending_generated_batch = pending_generated_batch
                     inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
 
                 batch = None
