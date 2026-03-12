@@ -741,6 +741,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # Phase 3: Build final updated_problems list (one per unique uid)
         # Build generated_samples and pending_generated_batch for RL reward in next train_batch
+        pending_generated_batch = generated_output
         generated_samples = []
         updated_problems = []
         current_next_id = next_problem_id
