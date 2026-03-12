@@ -763,7 +763,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 updated_problems.append({
                     **original_problem_data,
                     "action": "keep",
-                    "keep_count": keep_count,
+                    "keep_count": keep_count+1,
                     "problem_id":problem_id,
                     "level":level,
                     "data_source":"general-reasoner",
@@ -823,7 +823,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                         'level': original_problem_data['extra_info']['level'],
                                     },
                                     "action": "keep",
-                                    "keep_count": 0,
+                                    "keep_count": keep_count,
                                     "problem_id": problem_id,
                                     "level": new_level,
                                     "data_source": variant['uid'],
@@ -843,7 +843,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 new_item ={
                                     **original_problem_data,
                                     "action": "keep",
-                                    "keep_count": keep_count,
+                                    "keep_count": keep_count+1,
                                     "problem_id":problem_id,
                                     "level":level,
                                     "data_source": variant['uid'],
@@ -862,7 +862,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             new_item ={
                                 **original_problem_data,
                                 "action": "keep",
-                                "keep_count": keep_count,
+                                "keep_count": keep_count+1,
                                 "problem_id":problem_id,
                                 "level":level,
                                 "data_source": variant['uid'],
@@ -963,58 +963,45 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         upgrade_threshold = getattr(self.config.data, 'upgrade_threshold', 0.8)
         degrade_threshold = getattr(self.config.data, 'degrade_threshold', -0.2)
-        keep_max = getattr(self.config.data, 'keep_max', 5)
+        keep_max = getattr(self.config.data, 'keep_max', 0)
 
         updated_actions = []
-        updated_keep_counts = []
 
         # Process each unique uid
         for uid in unique_uids:
             avg_reward = uid_to_avg_reward[uid]
-            current_action = current_actions.get(uid, "keep")
             current_keep_count = current_keep_counts.get(uid, 0)
 
             # Update action based on average reward for this uid
-            if current_keep_count >= keep_max:
-                    new_keep_count = 0
-                    new_action = 'replace'
-            elif avg_reward > upgrade_threshold:
+            if avg_reward > upgrade_threshold:
                 new_action = 'upgrade'
-                new_keep_count = current_keep_count + 1
             elif avg_reward < degrade_threshold:
                 new_action = 'degrade'
-                new_keep_count = current_keep_count + 1
+            elif current_keep_count >= keep_max:
+                new_action = 'replace'
             else:
                 # Keep action
-                new_keep_count = current_keep_count + 1
                 new_action = 'keep'
 
             # Store per-uid results
             updated_actions.append(new_action)
-            updated_keep_counts.append(new_keep_count)
 
         # Update the batch with new actions and keep_counts (per-uid)
         # Note: Since batch is expanded with multiple samples per uid, we need to
         # replicate the per-uid actions/keep_counts for all samples of each uid
         batch_updated_actions = []
-        batch_updated_keep_counts = []
-
         for uid in uids:
             if uid in unique_uids:
                 idx = unique_uids.index(uid)
                 batch_updated_actions.append(updated_actions[idx])
-                batch_updated_keep_counts.append(updated_keep_counts[idx])
             else:
                 # Fallback for uids not in our processing
                 batch_updated_actions.append("keep")
-                batch_updated_keep_counts.append(0)
 
         # Add assertion to verify dimensions match
         assert len(batch_updated_actions) == len(uids), f"Action length mismatch: {len(batch_updated_actions)} vs {len(uids)}"
-        assert len(batch_updated_keep_counts) == len(uids), f"Keep count length mismatch: {len(batch_updated_keep_counts)} vs {len(uids)}"
 
         batch.non_tensor_batch["action"] = np.array(batch_updated_actions, dtype=object)
-        batch.non_tensor_batch["keep_count"] = np.array(batch_updated_keep_counts, dtype=object)
 
     def _generate_problem_variants(self, original_problems, num_variations_per_problem=4):
         """

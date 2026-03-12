@@ -17,8 +17,8 @@ lr_warmup_steps=0
 lr=1e-6
 test_and_save_freq=20
 n_resp_per_prompt=8
-train_prompt_bsz=8
-train_prompt_mini_bsz=8
+train_prompt_bsz=64
+train_prompt_mini_bsz=64
 
 
 
