@@ -36,11 +36,16 @@ def _normalize_row_for_arrow(row: dict) -> dict:
     """
     row = dict(row)
     # Top-level text fields
-    for key in ("problem", "answer", "question"):
+    for key in ("problem", "answer", "question","action","super_uid","data_source","ability"):
         if key in row and row[key] is not None:
             row[key] = str(row[key])
         elif key in row:
             row[key] = ""
+    for key in ("level","problem_id"):
+        if key in row and row[key] is not None:
+            row[key] = int(row[key])
+        elif key in row:
+            row[key] = 0
     # extra_info: question, answer (and any other text that might be mixed type)
     if "extra_info" in row and isinstance(row["extra_info"], dict):
         ei = dict(row["extra_info"])

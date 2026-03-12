@@ -4,7 +4,7 @@ export WANDB_MODE=offline
 
 
 normalize_update_by_reference_batch_size=true
-keep_max=1
+keep_max=0
 generation_train=true
 
 

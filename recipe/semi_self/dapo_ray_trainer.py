@@ -830,7 +830,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                                     "data_source": variant['uid'],
                                     "super_uid":super_uid
                                 }
-                                new_item["from_generation_uid"] = str(uid)
                                 updated_problems.append(new_item)
                                 self.pending_super_uid_to_new_item[super_uid]= new_item
 
