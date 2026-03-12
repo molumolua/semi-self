@@ -44,7 +44,7 @@ def _normalize_row_for_arrow(row: dict) -> dict:
     # extra_info: question, answer (and any other text that might be mixed type)
     if "extra_info" in row and isinstance(row["extra_info"], dict):
         ei = dict(row["extra_info"])
-        for key in ("question", "answer", "split"):
+        for key in ("question", "answer", "split", "level"):
             if key in ei and ei[key] is not None:
                 ei[key] = str(ei[key])
             elif key in ei:

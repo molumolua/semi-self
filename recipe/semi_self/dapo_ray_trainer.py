@@ -672,7 +672,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 uid_to_action[uid] = actions[i] if i < len(actions) else "keep"
                 uid_to_keep_count[uid] = keep_counts[i] if i < len(keep_counts) else 0
                 uid_to_problem_id[uid] = problem_ids[i]
-                uid_to_level[uid] =levels[i]
+                uid_to_level[uid] =int(levels[i])
                 if len(super_uids) > 0:
                     uid_to_super_uid[uid]=super_uids[i]
                 
