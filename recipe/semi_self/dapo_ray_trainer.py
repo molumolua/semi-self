@@ -809,25 +809,25 @@ class RayDAPOTrainer(RayPPOTrainer):
                                         },
                                         {
                                             "role": "user",
-                                            "content": variant['problem'],
+                                            "content": str(variant['problem']),
                                         }
                                     ],
                                     "reward_model": {
                                         "style": "rule",
-                                        "ground_truth": variant['answer'],
+                                        "ground_truth": str(variant['answer']),
                                     },
                                     "extra_info": {
                                         'split': original_problem_data['extra_info']['split'],
                                         'index': original_problem_data['extra_info']['index'],
-                                        'answer': variant['answer'],
-                                        "question": variant['problem'],
+                                        'answer': str(variant['answer']),
+                                        "question": str(variant['problem']),
                                         'level': original_problem_data['extra_info']['level'],
                                     },
                                     "action": "keep",
                                     "keep_count": keep_count,
                                     "problem_id": problem_id,
                                     "level": new_level,
-                                    "data_source": variant['uid'],
+                                    "data_source": str(variant['uid']),
                                     "super_uid":super_uid
                                 }
                                 updated_problems.append(new_item)
