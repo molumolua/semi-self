@@ -846,7 +846,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                     "keep_count": keep_count+1,
                                     "problem_id":problem_id,
                                     "level":level,
-                                    "data_source": variant['uid'],
+                                    "data_source": str(variant['uid']),
                                     "super_uid":super_uid
                                 }
                                 updated_problems.append(new_item)
@@ -865,7 +865,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 "keep_count": keep_count+1,
                                 "problem_id":problem_id,
                                 "level":level,
-                                "data_source": variant['uid'],
+                                "data_source": str(variant['uid']),
                                 "super_uid":super_uid
                             }
                             updated_problems.append(new_item)
