@@ -466,8 +466,12 @@ class RayDAPOTrainer(RayPPOTrainer):
             # which won't affect the advantage calculation (since it's based on uid),
             # but might affect the loss calculation (due to the change of mini-batching).
             # TODO: Decouple the DP balancing and mini-batching.
+            # Skip when batch_size is not divisible by world_size (e.g. semi-self merged batch 2052 % 8).
             if self.config.trainer.balance_batch:
-                self._balance_batch(batch, metrics=metrics)
+                batch_size = batch.batch["attention_mask"].shape[0]
+                world_size = self.actor_rollout_wg.world_size
+                if batch_size % world_size == 0:
+                    self._balance_batch(batch, metrics=metrics)
 
             # compute global_valid tokens
             batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
