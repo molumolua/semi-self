@@ -6,6 +6,7 @@ export WANDB_MODE=offline
 normalize_update_by_reference_batch_size=true
 keep_max=0
 generation_train=true
+num_variations_per_problem=8
 
 
 
@@ -24,13 +25,13 @@ lr_warmup_steps=0
 lr=1e-6
 test_and_save_freq=20
 n_resp_per_prompt=8
-train_prompt_bsz=64
-train_prompt_mini_bsz=64
+train_prompt_bsz=32
+train_prompt_mini_bsz=32
 
 
 
 
-exp_name=${exp_name:-"gt-${generation_train}-normalize-${normalize_update_by_reference_batch_size}-keep-${keep_max}-model-${model_name}-lr-${lr}-bsz-${train_prompt_bsz}-n_resp-${n_resp_per_prompt}-mini-${train_prompt_mini_bsz}"}
+exp_name=${exp_name:-"np-${num_variations_per_problem}-gt-${generation_train}-normalize-${normalize_update_by_reference_batch_size}-keep-${keep_max}-model-${model_name}-lr-${lr}-bsz-${train_prompt_bsz}-n_resp-${n_resp_per_prompt}-mini-${train_prompt_mini_bsz}"}
 # exp_name=${exp_name:-"None-test-data-True-select-False-batch-size-192-64-64-1-7-0-7-replay-0-entropy_coeff-0-dataset-think-DeepMath-103K-model-Qwen2.5-7B"}
 adv_estimator=grpo
 
@@ -162,5 +163,6 @@ PYTHONUNBUFFERED=1 python3 -m recipe.semi_self.main_dapo \
     +data.degrade_threshold=0.2 \
     +data.keep_max=${keep_max} \
     +actor_rollout_ref.actor.normalize_update_by_reference_batch_size=${normalize_update_by_reference_batch_size}\
-    +trainer.generation_train=${generation_train}
+    +trainer.generation_train=${generation_train} \
+    +trainer.num_variations_per_problem=${num_variations_per_problem}
 
