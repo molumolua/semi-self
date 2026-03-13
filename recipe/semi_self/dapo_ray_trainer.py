@@ -27,6 +27,7 @@ import torch
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor
 from tensordict import TensorDict
 from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.trainer.ppo.core_algos import agg_loss
@@ -466,6 +467,13 @@ class RayDAPOTrainer(RayPPOTrainer):
             # which won't affect the advantage calculation (since it's based on uid),
             # but might affect the loss calculation (due to the change of mini-batching).
             # TODO: Decouple the DP balancing and mini-batching.
+            # Skip when batch_size is not divisible by world_size (e.g. semi-self merged batch 2052 % 8).
+            world_size = self.actor_rollout_wg.world_size
+            batch_size = batch.batch["attention_mask"].shape[0]
+            pad_size = 0
+            if batch_size % world_size != 0:
+                # Pad so DP chunk (e.g. compute_log_prob) can split evenly; trim before advantage.
+                batch, pad_size = pad_dataproto_to_divisor(batch, world_size)
             if self.config.trainer.balance_batch:
                 self._balance_batch(batch, metrics=metrics)
 
@@ -491,6 +499,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                 metrics.update(is_metrics)
 
             with marked_timer("adv", timing_raw, "brown"):
+                # Remove padding added for DP chunking so advantage is only over real samples.
+                if pad_size > 0:
+                    original_len = len(batch) - pad_size
+                    batch = batch.select_idxs(list(range(original_len)))
+                    batch.meta_info["global_token_num"] = batch.meta_info["global_token_num"][:original_len]
                 # compute advantages, executed on the driver process
                 norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
                 batch = compute_advantage(
