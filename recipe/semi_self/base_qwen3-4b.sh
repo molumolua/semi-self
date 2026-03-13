@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 export WANDB_MODE=offline
-dataset_name="FROGE_5"
+
+
+normalize_update_by_reference_batch_size=true
+keep_max=0
+generation_train=true
+
+
+
 model_name="Qwen3-4B-Base"
-offload=True
-ref_offload=True
-num_gpus=4
+offload=False
+ref_offload=False
+num_gpus=8
 tensor_model_parallel_size=4
 
+reward_model_name="TIGER-Lab/general-verifier"
+
 epoch=1000
-project_name='ACL2026'
+project_name='semi-self'
 
 lr_warmup_steps=0
 lr=1e-6
@@ -21,11 +30,11 @@ train_prompt_mini_bsz=64
 
 
 
-exp_name=${exp_name:-"new-${dataset_name}-model-${model_name}-lr-${lr}-bsz-${train_prompt_bsz}-n_resp-${n_resp_per_prompt}-mini-${train_prompt_mini_bsz}"}
+exp_name=${exp_name:-"gt-${generation_train}-normalize-${normalize_update_by_reference_batch_size}-keep-${keep_max}-model-${model_name}-lr-${lr}-bsz-${train_prompt_bsz}-n_resp-${n_resp_per_prompt}-mini-${train_prompt_mini_bsz}"}
 # exp_name=${exp_name:-"None-test-data-True-select-False-batch-size-192-64-64-1-7-0-7-replay-0-entropy_coeff-0-dataset-think-DeepMath-103K-model-Qwen2.5-7B"}
 adv_estimator=grpo
 
-gpu_memory_utilization=0.8
+gpu_memory_utilization=0.7
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
@@ -51,11 +60,12 @@ filter_groups_metric=acc
 # WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 # RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 # Paths
-RAY_DATA_HOME=${RAY_DATA_HOME:-"/inspire/hdd/global_user/xucaijun-253108120121/SCALER"}
-MODEL_PATH=${MODEL_PATH:-"/inspire/hdd/global_user/xucaijun-253108120121/SCALER/ckpts/ACL2026/new-FROGE_5-model-Qwen3-4B-Base-lr-1e-6-bsz-64-n_resp-8-mini-64/global_step_840/actor_huggingface"}
+RAY_DATA_HOME=${RAY_DATA_HOME:-"/inspire/hdd/global_user/xucaijun-253108120121/semi-self"}
+MODEL_PATH=${MODEL_PATH:-"/inspire/hdd/global_user/xucaijun-253108120121/Model/Qwen/${model_name}"}
+REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-"/inspire/hdd/global_user/xucaijun-253108120121/Model/${reward_model_name}"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/SCALER-data/train/${dataset_name}.parquet"}
-TEST_FILE=${TEST_FILE:-["${RAY_DATA_HOME}/SCALER-data/test/bbeh_data.parquet","${RAY_DATA_HOME}/SCALER-data/test/think_MATH-500_MATH-500-processed.parquet","${RAY_DATA_HOME}/SCALER-data/test/think_amc23_amc23_test.parquet","${RAY_DATA_HOME}/SCALER-data/test/think_aime24_aime24_test.parquet","${RAY_DATA_HOME}/SCALER-data/test/MMLU-Pro-Valid.parquet","${RAY_DATA_HOME}/SCALER-data/test/GPQA-Diamond-Test.parquet"]}
+TRAIN_FILE=${TRAIN_FILE:-"/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/webinstruct-verified/train.parquet"}
+TEST_FILE=${TEST_FILE:-["/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/bbeh_data.parquet","/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/think_MATH-500_MATH-500-processed.parquet","/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/think_amc23_amc23_test.parquet","/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/think_aime24_aime24_test.parquet","/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/MMLU-Pro-Valid.parquet"]}
 
 # Algorithm
 temperature=1.0
@@ -72,7 +82,7 @@ actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 max_num_gen_batches=100
 
-PYTHONUNBUFFERED=1 python3 -m recipe.dapo.main_dapo \
+PYTHONUNBUFFERED=1 python3 -m recipe.semi_self.main_dapo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
@@ -131,10 +141,11 @@ PYTHONUNBUFFERED=1 python3 -m recipe.dapo.main_dapo \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
-    reward_model.reward_manager=dapo \
-    reward_model.overlong_buffer.enable=${enable_overlong_buffer} \
-    reward_model.overlong_buffer.len=${overlong_buffer_len} \
-    reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
+    reward_model.reward_manager=native \
+    reward_model.enable=True \
+    reward_model.model.path="${REWARD_MODEL_PATH}" \
+    reward_model.strategy=verifier \
+    reward_model.reward_manager=naive \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
@@ -146,5 +157,10 @@ PYTHONUNBUFFERED=1 python3 -m recipe.dapo.main_dapo \
     trainer.total_epochs=${epoch} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
-    +trainer.max_actor_ckpt_to_keep=1 
+    +trainer.max_actor_ckpt_to_keep=1  \
+    +data.upgrade_threshold=0.8 \
+    +data.degrade_threshold=0.2 \
+    +data.keep_max=${keep_max} \
+    +actor_rollout_ref.actor.normalize_update_by_reference_batch_size=${normalize_update_by_reference_batch_size}\
+    +trainer.generation_train=${generation_train}
 
