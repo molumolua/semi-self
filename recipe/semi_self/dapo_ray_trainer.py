@@ -475,10 +475,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 # Pad so DP chunk (e.g. compute_log_prob) can split evenly; trim before advantage.
                 batch, pad_size = pad_dataproto_to_divisor(batch, world_size)
             if self.config.trainer.balance_batch:
-                batch_size = batch.batch["attention_mask"].shape[0]
-                world_size = self.actor_rollout_wg.world_size
-                if batch_size % world_size == 0:
-                    self._balance_batch(batch, metrics=metrics)
+                self._balance_batch(batch, metrics=metrics)
 
             # compute global_valid tokens
             batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
