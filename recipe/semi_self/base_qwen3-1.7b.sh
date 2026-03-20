@@ -64,7 +64,7 @@ RAY_DATA_HOME=${RAY_DATA_HOME:-"/inspire/hdd/global_user/xucaijun-253108120121/s
 MODEL_PATH=${MODEL_PATH:-"/inspire/hdd/global_user/xucaijun-253108120121/Model/Qwen/${model_name}"}
 REWARD_MODEL_PATH=${REWARD_MODEL_PATH:-"/inspire/hdd/global_user/xucaijun-253108120121/Model/${reward_model_name}"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/webinstruct-verified/train.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/WEB/train.parquet"}
 TEST_FILE=${TEST_FILE:-["/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/bbeh_data.parquet","/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/think_MATH-500_MATH-500-processed.parquet","/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/think_amc23_amc23_test.parquet","/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/think_aime24_aime24_test.parquet","/inspire/hdd/global_user/xucaijun-253108120121/Dataset-P/MMLU-Pro-Valid.parquet"]}
 
 # Algorithm

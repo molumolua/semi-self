@@ -140,39 +140,14 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         timing_raw = defaultdict(float)
         batch = None
-        original_batch=None
-        added_batch = None
-        num_prompt_in_batch = 0
         
-        # One entry per dataset row: current training snapshot for that problem_id.
-        self.all_train_object = []
-        for i,item in enumerate(self.train_dataset.dataframe):
-            self.all_train_object.append({**item, "action": "keep", "problem_id": i,"knowledge": []})
-        # Get train problems directly from the raw dataframe (not processed data)
-        # since InMemoryRLHFDataset expects raw data with 'prompt' field
-        train_problems = []
-        for i in range(min(self.config.data.train_batch_size, len(self.all_train_object))):
-            # Get raw data from dataframe, not processed data from __getitem__
-            problem = dict(self.all_train_object[i])
-            train_problems.append(problem)
 
-
-        inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
-
-        next_problem_id = self.config.data.train_batch_size
 
         for epoch in range(self.config.trainer.total_epochs):
             # only one batch for InMemoryRLHFDataset
-            for batch_dict in inmemory_dataloader:
+            for batch_dict in self.train_dataloader:
                 is_last_step = self.global_steps >= self.total_training_steps
-                (
-                    batch,
-                    metrics,
-                    train_problems,
-                    action_counts,
-                    generated_samples,
-                    pending_generated_batch,
-                ) = self.train_batch(
+                batch,metrics=self.train_batch(
                     batch_dict,
                     prev_step_profile,
                     curr_step_profile,
@@ -248,7 +223,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             logger.log(data=metrics, step=self.global_steps)
 
     def get_item_from_all_train(self, problem_id):
-        return self.all_train_object[problem_id]
+        return self.train_dataset.dataframe[problem_id]
 
 
     def _merge_pending_generated_batch_into_train_batch(self, new_batch: DataProto,pending_generated_batch: DataProto) -> DataProto:
@@ -551,7 +526,6 @@ class RayDAPOTrainer(RayPPOTrainer):
             )
 
         timing_update_problems = defaultdict(float)
-        generated_samples = []
         pending_generated_batch = None
         action_counts = {}
 
@@ -563,17 +537,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                 (
                     train_problems,
                     action_counts,
-                    generated_samples,
                     pending_generated_batch,
                 ) = self.update_problems(batch)
 
-                metrics["timing/update_problems"] = timing_update_problems["update_problems"]
-                metrics["train/action_drop"] = action_counts["drop"]
-                metrics["train/action_add_in_context_knowledge"] = action_counts["add_in_context_knowledge"]
-                metrics["train/action_add_in_context_knowledge_success"] = action_counts[
-                    "add_in_context_knowledge_success"
-                ]
-                metrics["train/new_problems_appended"] = action_counts["new_problems_appended"]
 
             # Pass 2: single batch from refreshed curriculum — same path as (606): rollout + reward
             batach_dict_with_knowledge = self.collate_single_batch_from_train_problems(train_problems)
@@ -582,22 +548,18 @@ class RayDAPOTrainer(RayPPOTrainer):
             )
             
             # Pass 3: merge pending generated batch, train batch ,batch_with_knowledge
-            batch_with_knowledge = self._merge_pending_generated_batch_into_train_batch(batch_with_knowledge)
+            batch_with_knowledge = self._merge_pending_generated_batch_into_train_batch(batch_with_knowledge,pending_generated_batch)
             batch = batch.union(batch_with_knowledge)
 
 
-
+            # Pass 4: compute advantage and backward
             batch, metrics = self._compute_advantage_and_backward(
                 batch, metrics, timing_raw, reward_extra_infos_dict
             )
 
         return (
             batch,
-            metrics,
-            train_problems,
-            action_counts,
-            generated_samples,
-            pending_generated_batch,
+            metrics
         )
 
     def createInmemoryDataLoader(self,train_problems):
@@ -641,7 +603,6 @@ class RayDAPOTrainer(RayPPOTrainer):
         uids = np.asarray(uids) if not isinstance(uids, np.ndarray) else uids
         actions = batch.non_tensor_batch.get("action", [])
         problem_ids = batch.non_tensor_batch.get("problem_id", [])
-        super_uids = batch.non_tensor_batch.get("super_uid", [])
         
 
         
@@ -659,19 +620,12 @@ class RayDAPOTrainer(RayPPOTrainer):
         # Aggregate actions by uid (since batch contains multiple rollouts per prompt)
         uid_to_action = {}
         uid_to_problem_id = {}
-        uid_to_super_uid = {}
         
         for i, uid in enumerate(uids):
             if uid not in uid_to_action:
                 uid_to_action[uid] = actions[i] if i < len(actions) else "keep"
                 uid_to_problem_id[uid] = problem_ids[i]
-                if len(super_uids) > 0:
-                    uid_to_super_uid[uid]=super_uids[i]
-                
-        
-        self.pending_super_uid_to_new_item = {}
-        
-        
+
 
         # Update counters based on unique uids
         for action in uid_to_action.values():
@@ -695,7 +649,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         generated_variants = {}
         problem_indices = []
         generated_output = None
-        parse_success_list = []
+
         if generation_tasks:
             all_problems = []
             for uid, action in generation_tasks:
@@ -726,7 +680,6 @@ class RayDAPOTrainer(RayPPOTrainer):
         # Phase 3: Build final updated_problems list (one per unique uid)
         # Build generated_samples and pending_generated_batch for RL reward in next train_batch
         pending_generated_batch = generated_output
-        generated_samples = []
         updated_problems = []
         
 
@@ -760,17 +713,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                             }
                             updated_problems.append(new_item)
 
-                            generated_samples.append({
-                                "problem_id": uid_to_problem_id.get(uid, 0),
-                                "parsed_success": bool(variant.get("knowledge")),
-                            })
                         # If action doesn't need add_knowledge, that prompt is dropped entirely.
                         
                 else:
                     raise ValueError(f"Unexpect error for {original_problem_data}")
 
 
-        return updated_problems, action_counts, generated_samples, pending_generated_batch
+        return updated_problems, action_counts,  pending_generated_batch
         
 
     def update_problems_simple(self, train_problems, next_problem_id):
