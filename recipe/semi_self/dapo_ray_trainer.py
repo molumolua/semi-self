@@ -633,7 +633,13 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 
                 
-        uid_to_avg_reward = batch.meta_info.get("uid_to_avg_reward") or batch.non_tensor_batch.get("uid_to_avg_reward") or {}
+        uid_to_avg_metric = (
+            batch.meta_info.get("uid_to_avg_acc")
+            or batch.meta_info.get("uid_to_avg_reward")
+            or batch.non_tensor_batch.get("uid_to_avg_acc")
+            or batch.non_tensor_batch.get("uid_to_avg_reward")
+            or {}
+        )
         # Phase 0: Cleanup uids by data_source — keep all for "general-reasoner", else keep only highest-reward uid per gen
         data_sources = batch.non_tensor_batch.get("data_source", None)
         if data_sources is not None:
@@ -660,7 +666,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             else:
                 best_uid = max(
                     unique_uids,
-                    key=lambda u:  1-2*abs(uid_to_avg_reward.get(u,0.0)-0.5),
+                    key=lambda u:  1-2*abs(uid_to_avg_metric.get(u,0.0)-0.5),
                 )
                 keep_uids.add(best_uid)
                 best_uids.add(best_uid)
@@ -848,43 +854,34 @@ class RayDAPOTrainer(RayPPOTrainer):
 
     def update_action(self, batch: DataProto):
         """
-        Update actions for prompts based on their reward scores.
-        Rewards are aggregated by uid since batch contains multiple rollouts per prompt.
+        Update actions based on verifier accuracy (acc), aggregated by uid.
 
         Args:
-            batch: DataProto containing the batch data with rewards
+            batch: DataProto containing non_tensor_batch["acc"] and uids
         """
-        # Get rewards from batch
-        rewards = batch.batch.get("token_level_rewards", None)
+        acc_vals = batch.non_tensor_batch.get("acc", None)
         uids = batch.non_tensor_batch.get("uid", [])
 
-        if rewards is None or len(uids) == 0:
+        if acc_vals is None or len(uids) == 0:
             return
 
-        # Calculate average reward for each sample (sum over sequence dimension)
-        reward_sums = rewards.sum(dim=-1)  # (batch_size,)
-        # Clamp negative rewards to 0 per sample
-        sample_rewards = reward_sums.clamp(min=0)
+        acc_vals = np.asarray(acc_vals, dtype=np.float32)
 
-        # Aggregate rewards by uid (each uid corresponds to one original prompt)
-        uid_to_rewards = {}
+        # Aggregate acc by uid (each uid corresponds to one original prompt; batch may have multiple rollouts)
+        uid_to_acc_list = {}
         for i, uid in enumerate(uids):
-            if uid not in uid_to_rewards:
-                uid_to_rewards[uid] = []
-            uid_to_rewards[uid].append(sample_rewards[i].item())
+            if i >= len(acc_vals):
+                continue
+            uid_to_acc_list.setdefault(uid, []).append(float(acc_vals[i]))
 
-
-        # Calculate average reward per uid
-        uid_to_avg_reward = {}
-        for uid, reward_list in uid_to_rewards.items():
-            uid_to_avg_reward[uid] = sum(reward_list) / len(reward_list)
-
+        uid_to_avg_acc = {uid: sum(vals) / len(vals) for uid, vals in uid_to_acc_list.items()}
 
         # Store for Phase 0 in update_problems (cleanup by data_source)
-        batch.meta_info["uid_to_avg_reward"] = uid_to_avg_reward  # also in meta_info so it survives batch split
+        batch.meta_info["uid_to_avg_acc"] = uid_to_avg_acc
+        batch.meta_info["uid_to_avg_reward"] = uid_to_avg_acc  # backward compat: same values, acc-based
 
         # Since batch is expanded, we need to get unique uids and their corresponding actions
-        unique_uids = list(uid_to_avg_reward.keys())
+        unique_uids = list(uid_to_avg_acc.keys())
         batch_data_sources = batch.non_tensor_batch.get("data_source", [])
         uid_to_data_source = {}
         for i, uid in enumerate(uids):
@@ -903,13 +900,13 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # Process each unique uid
         for uid in unique_uids:
-            avg_reward = uid_to_avg_reward[uid]
+            avg_acc = uid_to_avg_acc[uid]
             data_source = uid_to_data_source.get(uid, "general-reasoner")
-            # Update action based on average reward for this uid
+            # Update action based on average acc for this uid
             if data_source != "general-reasoner":
                 # Already augmented once, do not add knowledge again next round.
                 new_action = 'drop'
-            elif avg_reward < add_knowledge_threshold:
+            elif avg_acc < add_knowledge_threshold:
                 new_action = 'add_in_context_knowledge'
             else:
                 new_action = 'drop'
