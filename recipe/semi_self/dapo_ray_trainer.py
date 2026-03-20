@@ -553,14 +553,14 @@ class RayDAPOTrainer(RayPPOTrainer):
                     batch_dict_with_knowledge, metrics, timing_raw
                 )
 
-            # Pass 3: attach generated variants + rewards, then union Pass-1 and Pass-2 batches
+            # attach generated variants + rewards, then union Pass-1 and Pass-2 batches
             with marked_timer("train_batch/merge_and_union", timing_raw, "blue"):
                 batch_with_knowledge = self._merge_pending_generated_batch_into_train_batch(
                     batch_with_knowledge, pending_generated_batch
                 )
                 batch = batch.union(batch_with_knowledge)
 
-            # Pass 4: advantage + PPO backward (inner stages also record into timing_raw)
+            # advantage + PPO backward (inner stages also record into timing_raw)
             with marked_timer("train_batch/ppo_backward", timing_raw, "pink"):
                 batch, metrics = self._compute_advantage_and_backward(
                     batch, metrics, timing_raw, reward_extra_infos_dict
