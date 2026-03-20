@@ -298,7 +298,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     r_gen = -0.5
                 else:
                     if uid not in uid_to_acc:
-                        raise ValueError(f"uid {uid} not found in uid_to_acc").
+                        raise ValueError(f"uid {uid} not found in uid_to_acc")
                     acc = uid_to_acc[uid]
                     r_gen = acc
                 keep_indices.append(i)
@@ -326,7 +326,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 added_batch.non_tensor_batch["uid"] = np.array(
                     [f"gen_{i}" for i in range(len(keep_indices))], dtype=object
                 )
-                
+
                 for k in new_batch.non_tensor_batch.keys():
                     if k not in added_batch.non_tensor_batch:
                         added_batch.non_tensor_batch[k] = np.array([None] * len(keep_indices), dtype=object)
