@@ -259,10 +259,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     "timing/update_problems": timing_raw["update_problems"],
                     "train/action_keep": action_counts["keep"],
                     "train/action_replace": action_counts["replace"],
-                    "train/action_upgrade": action_counts["upgrade"],
-                    "train/action_degrade": action_counts["degrade"],
-                    "train/action_upgrade_success": action_counts["upgrade_success"],
-                    "train/action_degrade_success": action_counts["degrade_success"]
+                    "train/action_add_in_context_knowledge": action_counts["add_in_context_knowledge"],
+                    "train/action_add_in_context_knowledge_success": action_counts["add_in_context_knowledge_success"]
                 }
             logger.log(data=update_metrics, step=self.global_steps)
         # check if last step checkpint exists
@@ -400,7 +398,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 for sid, r_list in super_uid_to_rewards.items():
                     super_uid_to_acc[sid] = sum(r_list) / len(r_list)
 
-            # Merge pending generated batch (from previous step's upgrade/degrade) with rewards for PPO
+            # Merge pending generated batch (from previous step's add_in_context_knowledge) with rewards for PPO
             if getattr(self, "pending_generated_batch", None) is not None and getattr(self, "pending_generated_samples", None):
                 pending_batch = self.pending_generated_batch
                 pending_samples = self.pending_generated_samples
@@ -673,10 +671,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         action_counts = {
             'keep': 0,
             'replace': 0,
-            'upgrade': 0,
-            'degrade': 0,
-            'upgrade_success': 0,  # Actually successfully upgraded
-            'degrade_success': 0   # Actually successfully degraded
+            'add_in_context_knowledge': 0,
+            'add_in_context_knowledge_success': 0
         }
 
        
@@ -710,10 +706,8 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # Update counters based on unique uids
         for action in uid_to_action.values():
-            if action == 'upgrade':
-                action_counts['upgrade'] += 1
-            elif action == 'degrade':
-                action_counts['degrade'] += 1
+            if action == 'add_in_context_knowledge':
+                action_counts['add_in_context_knowledge'] += 1
             elif action == 'replace':
                 action_counts['replace'] += 1
             elif action == 'keep':
@@ -727,16 +721,15 @@ class RayDAPOTrainer(RayPPOTrainer):
         generation_tasks = []  # List of (uid, action)
 
         for uid, action in uid_to_action.items():
-            if action in ['upgrade', 'degrade']:
+            if action == 'add_in_context_knowledge':
                 generation_tasks.append((uid, action))
 
-        # Phase 2: Batch generate variants for all upgrade/degrade operations
+        # Phase 2: Batch generate variants for add_in_context_knowledge operations
         generated_variants = {}
         problem_indices = []
         generated_output = None
         parse_success_list = []
         if generation_tasks:
-            # Unified batch processing for both upgrade and degrade
             all_problems = []
             for uid, action in generation_tasks:
                 problem_id = uid_to_problem_id.get(uid, 0)
@@ -751,9 +744,8 @@ class RayDAPOTrainer(RayPPOTrainer):
 
             # Batch generate all variants at once (each prompt -> N variants in all_variants)
             if all_problems:
-                all_variants, upgrade_success_count, degrade_success_count, generated_output, parse_success_list = self._generate_problem_variants(all_problems, num_variations_per_problem)
-                action_counts['upgrade_success'] = upgrade_success_count
-                action_counts['degrade_success'] = degrade_success_count
+                all_variants, add_knowledge_success_count, generated_output, parse_success_list = self._generate_problem_variants(all_problems, num_variations_per_problem)
+                action_counts['add_in_context_knowledge_success'] = add_knowledge_success_count
                 num_prompts = len(problem_indices)
                 for p in range(num_prompts):
                     uid, action = problem_indices[p]
@@ -803,7 +795,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 })
                 current_next_id += 1
 
-            elif action in ['upgrade', 'degrade']:
+            elif action == 'add_in_context_knowledge':
                 original_problem_data = self.get_item_from_all_train(problem_id)
 
                 if uid in generated_variants:
@@ -815,10 +807,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                         if v.get('problem') and v.get('answer'):
                             if variant_action is not None and variant and variant['problem'] and variant['answer']:
                                 new_level = level
-                                if variant_action == 'upgrade':
-                                    new_level += 1
-                                else:
-                                    new_level -= 1
                                 new_item = {
                                     **original_problem_data,
                                     "prompt": [
@@ -831,17 +819,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                                             "content": str(variant['problem']),
                                         }
                                     ],
-                                    "reward_model": {
-                                        "style": "rule",
-                                        "ground_truth": str(variant['answer']),
-                                    },
-                                    "extra_info": {
-                                        'split': original_problem_data['extra_info']['split'],
-                                        'index': original_problem_data['extra_info']['index'],
-                                        'answer': str(variant['answer']),
-                                        "question": str(variant['problem']),
-                                        'level': original_problem_data['extra_info']['level'],
-                                    },
                                     "action": "keep",
                                     "keep_count": keep_count,
                                     "problem_id": problem_id,
@@ -980,8 +957,11 @@ class RayDAPOTrainer(RayPPOTrainer):
             current_actions[uid] = batch_actions[i]
             current_keep_counts[uid] = batch_keep_counts[i] if i < len(batch_keep_counts) else 0
 
-        upgrade_threshold = getattr(self.config.data, 'upgrade_threshold', 0.8)
-        degrade_threshold = getattr(self.config.data, 'degrade_threshold', -0.2)
+        add_knowledge_threshold = getattr(
+            self.config.data,
+            'add_in_context_knowledge_threshold',
+            getattr(self.config.data, 'degrade_threshold', -0.2),
+        )
         keep_max = getattr(self.config.data, 'keep_max', 0)
 
         updated_actions = []
@@ -992,10 +972,8 @@ class RayDAPOTrainer(RayPPOTrainer):
             current_keep_count = current_keep_counts.get(uid, 0)
 
             # Update action based on average reward for this uid
-            if avg_reward > upgrade_threshold:
-                new_action = 'upgrade'
-            elif avg_reward < degrade_threshold:
-                new_action = 'degrade'
+            if avg_reward < add_knowledge_threshold:
+                new_action = 'add_in_context_knowledge'
             elif current_keep_count >= keep_max:
                 new_action = 'replace'
             else:
@@ -1024,17 +1002,16 @@ class RayDAPOTrainer(RayPPOTrainer):
 
     def _generate_problem_variants(self, original_problems, num_variations_per_problem=4):
         """
-        Generate problem variants using LLM (upgrade/degrade logic).
+        Generate in-context knowledge using LLM.
 
         Args:
             original_problems: List of dicts with 'problem', 'answer', and 'action'
             num_variations_per_problem: Number of variants per problem
 
         Returns:
-            tuple: (new_problems, upgrade_success_count, degrade_success_count)
-            - new_problems: List of dicts with 'problem' and 'answer' keys
-            - upgrade_success_count: Number of upgrade variants that were successfully parsed
-            - degrade_success_count: Number of degrade variants that were successfully parsed
+            tuple: (new_problems, add_knowledge_success_count)
+            - new_problems: List of dicts with 'problem', 'knowledge', and 'uid' keys
+            - add_knowledge_success_count: Number of parsed knowledge generations
         """
         import torch
         from verl import DataProto
@@ -1046,53 +1023,26 @@ class RayDAPOTrainer(RayPPOTrainer):
         prompts = []
         for problem_data in original_problems:
             problem = problem_data['problem']
-            answer = problem_data['answer']
-            label = problem_data.get('action', 'upgrade')  # Default to upgrade
+            label = problem_data.get('action', 'add_in_context_knowledge')
 
-            if label == 'upgrade':
-                # Create prompt to make the problem harder
+            if label == 'add_in_context_knowledge':
                 prompt = [{
                     "role":"user",
-                    "content":f"""You are given a problem in JSON format. Create a more difficult version of this problem.
-Keep the core concept the same but increase the complexity, add more constraints, or require deeper understanding.
+                    "content":f"""You are given a problem.
 
-Input:
+Problem:
+{problem}
+
+Return valid JSON in this format:
 ```json
-{{
-"problem": "{problem}",
-"answer": "{answer}"
-}}
+[
+  "knowledge 1",
+  "knowledge 2"
+]
 ```
 
-Generate a harder version and output in the same JSON format:
-```json
-{{
-"problem": "your harder problem here",
-"answer": "corresponding answer here"
-}}
-```
-"""}]
-            elif label == 'degrade':
-                # Create prompt to make the problem easier
-                prompt = [{
-                    "role":"user",
-                    "content":f"""You are given a problem in JSON format. Create a simpler version of this problem.
-Keep the core concept the same but reduce the complexity, simplify the requirements, or make it more straightforward.
-
-Input:
-```json
-{{
-"problem": "{problem}",
-"answer": "{answer}"
-}}
-```
-Generate an easier version and output in the same JSON format:
-```json
-{{
-"problem": "your easier problem here",
-"answer": "corresponding answer here"
-}}
-```
+Each string should be a piece of knowledge that helps solve the problem.
+Do not include any explanation or markdown.
 """}]
             else:
                 continue  # Skip unknown labels
@@ -1100,7 +1050,7 @@ Generate an easier version and output in the same JSON format:
             prompts.append(prompt)
 
         if not prompts:
-            return [], 0, 0, None, []
+            return [], 0, None, []
 
         # Repeat each prompt M times
         repeated_prompts = []
@@ -1203,8 +1153,7 @@ Generate an easier version and output in the same JSON format:
         new_problems = []
         batch_size = len(repeated_prompts)
         parse_success_count = 0
-        upgrade_success_count = 0
-        degrade_success_count = 0
+        add_knowledge_success_count = 0
         parse_success_list = []
 
         for i in range(batch_size):
@@ -1213,23 +1162,33 @@ Generate an easier version and output in the same JSON format:
             # Decode the generated text
             generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
-            # Try to parse as JSON: extract content from the last ```json ... ``` block
+            # Try to parse as JSON list of strings
             parsed_problem = None
             try:
                 json_block_pattern = re.compile(r'```json\s*([\s\S]*?)```')
                 matches = json_block_pattern.findall(generated_text)
-                if matches:
-                    json_str = matches[-1].strip()
-                    parsed_data = json.loads(json_str)
+                json_str = matches[-1].strip() if matches else generated_text
+                parsed_data = json.loads(json_str)
 
-                    # Extract problem and answer
-                    if parsed_data and 'problem' in parsed_data and 'answer' in parsed_data:
-                        uid_i = gen_batch.non_tensor_batch["uid"][i]
-                        parsed_problem = {
-                            'problem': parsed_data['problem'],
-                            'answer': parsed_data['answer'],
-                            'uid': uid_i,
-                        }
+                if isinstance(parsed_data, list) and all(isinstance(item, str) for item in parsed_data):
+                    uid_i = gen_batch.non_tensor_batch["uid"][i]
+                    original_idx = i // num_variations_per_problem
+                    original_problem_text = ""
+                    if original_idx < len(original_problems):
+                        original_problem_text = str(original_problems[original_idx].get('problem', ''))
+                    knowledge_lines = [k.strip() for k in parsed_data if isinstance(k, str) and k.strip()]
+                    combined_problem = original_problem_text
+                    if knowledge_lines:
+                        combined_problem = (
+                            f"{original_problem_text}\n\n"
+                            "Helpful knowledge:\n"
+                            + "\n".join([f"- {k}" for k in knowledge_lines])
+                        )
+                    parsed_problem = {
+                        'problem': combined_problem,
+                        'knowledge': knowledge_lines,
+                        'uid': uid_i,
+                    }
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
 
@@ -1241,17 +1200,19 @@ Generate an easier version and output in the same JSON format:
                 parse_success_count += 1
                 original_idx = i // num_variations_per_problem
                 if original_idx < len(original_problems):
-                    action = original_problems[original_idx].get('action', 'upgrade')
-                    if action == 'upgrade':
-                        upgrade_success_count += 1
-                    elif action == 'degrade':
-                        degrade_success_count += 1
+                    action = original_problems[original_idx].get('action', 'add_in_context_knowledge')
+                    if action == 'add_in_context_knowledge':
+                        add_knowledge_success_count += 1
             else:
                 # Fallback
                 uid_i = gen_batch.non_tensor_batch["uid"][i]
+                original_idx = i // num_variations_per_problem
+                original_problem_text = ""
+                if original_idx < len(original_problems):
+                    original_problem_text = str(original_problems[original_idx].get('problem', ''))
                 new_problems.append({
-                    'problem': "",
-                    'answer': '',
+                    'problem': original_problem_text,
+                    'knowledge': [],
                     'uid': uid_i,
                 })
             # Log the first case as an example
@@ -1260,8 +1221,8 @@ Generate an easier version and output in the same JSON format:
                 pprint(f"[generate output]: {generated_text}")
                 if parsed_problem:
                     pprint(f"[parsed problem]: {parsed_problem['problem']}")
-                    pprint(f"[parsed answer]: {parsed_problem['answer']}")
+                    pprint(f"[parsed knowledge]: {parsed_problem['knowledge']}")
                 else:
                     pprint("FAILED - falling back to raw text")
         pprint(f"parse success:{parse_success_count},batch_size:{batch_size}")
-        return new_problems, upgrade_success_count, degrade_success_count, generated_output, parse_success_list
+        return new_problems, add_knowledge_success_count, generated_output, parse_success_list

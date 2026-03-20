@@ -24,8 +24,8 @@ lr_warmup_steps=0
 lr=1e-6
 test_and_save_freq=20
 n_resp_per_prompt=8
-train_prompt_bsz=64
-train_prompt_mini_bsz=64
+train_prompt_bsz=16
+train_prompt_mini_bsz=16
 
 
 
@@ -43,7 +43,7 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.2
 
-max_prompt_length=$((1024 * 4))
+max_prompt_length=$((1024 * 8))
 max_response_length=$((1024 * 8))
 
 enable_overlong_buffer=False

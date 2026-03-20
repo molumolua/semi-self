@@ -44,7 +44,7 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.2
 
-max_prompt_length=$((1024 * 4))
+max_prompt_length=$((1024 * 8))
 max_response_length=$((1024 * 8))
 
 enable_overlong_buffer=False

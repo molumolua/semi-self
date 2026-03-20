@@ -138,7 +138,7 @@ class RewardModelWorker(Worker):
             sequence_strs.append(sequence_str)
 
             # Extract question and ground truth from non-tensor batch.
-            question = data_item.non_tensor_batch["extra_info"]["question"][:2048]
+            question = data_item.non_tensor_batch["extra_info"]["question"][:3072]
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"][:1024]
             questions.append(question)
             ground_truths.append(ground_truth)
