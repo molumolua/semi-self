@@ -257,10 +257,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                 update_metrics = {
                     "train/next_problem_id": next_problem_id,
                     "timing/update_problems": timing_raw["update_problems"],
-                    "train/action_keep": action_counts["keep"],
-                    "train/action_replace": action_counts["replace"],
+                    "train/action_drop": action_counts["drop"],
                     "train/action_add_in_context_knowledge": action_counts["add_in_context_knowledge"],
-                    "train/action_add_in_context_knowledge_success": action_counts["add_in_context_knowledge_success"]
+                    "train/action_add_in_context_knowledge_success": action_counts["add_in_context_knowledge_success"],
+                    "train/new_problems_appended": action_counts["new_problems_appended"],
                 }
             logger.log(data=update_metrics, step=self.global_steps)
         # check if last step checkpint exists
@@ -383,20 +383,21 @@ class RayDAPOTrainer(RayPPOTrainer):
             # Update actions based on reward scores
             self.update_action(new_batch)
 
-            # Compute super_uid -> average reward (acc) for samples from generated problems (for gen-step reward)
+            # Compute super_uid -> average acc for samples from generated problems (for gen-step reward)
             super_uid_to_acc = {}
-            rewards = new_batch.batch.get("token_level_rewards", None)
+            acc_vals = new_batch.non_tensor_batch.get("acc", None)
             super_uids = new_batch.non_tensor_batch.get("super_uid", None)
-            if rewards is not None and super_uids is not None:
-                reward_sums = rewards.sum(dim=-1).clamp(min=0)
-                super_uid_to_rewards = {}
+            if acc_vals is not None and super_uids is not None:
+                acc_vals = np.asarray(acc_vals, dtype=np.float32)
+                super_uid_to_acc_list = {}
                 for i in range(len(super_uids)):
                     sid = super_uids[i]
                     if sid is not None and str(sid).strip() != "":
                         sid = str(sid)
-                        super_uid_to_rewards.setdefault(sid, []).append(reward_sums[i].item())
-                for sid, r_list in super_uid_to_rewards.items():
-                    super_uid_to_acc[sid] = sum(r_list) / len(r_list)
+                        if i < len(acc_vals):
+                            super_uid_to_acc_list.setdefault(sid, []).append(float(acc_vals[i]))
+                for sid, a_list in super_uid_to_acc_list.items():
+                    super_uid_to_acc[sid] = sum(a_list) / len(a_list)
 
             # Merge pending generated batch (from previous step's add_in_context_knowledge) with rewards for PPO
             if getattr(self, "pending_generated_batch", None) is not None and getattr(self, "pending_generated_samples", None):
@@ -613,7 +614,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         Args:
             batch: DataProto batch containing actions aggregated by uid
             train_problems: Current list of training problems with their states
-            next_problem_id: Starting ID for new problems (used for replace action)
+            next_problem_id: Starting ID for newly appended problems
             num_variations_per_problem: Number of new problems to generate per original problem (M)
 
         Returns:
@@ -621,11 +622,10 @@ class RayDAPOTrainer(RayPPOTrainer):
             - generated_samples: list of dicts with super_uid, problem_id, level, parsed_success (for RL reward in next train_batch)
             - pending_generated_batch: DataProto from _generate_problem_variants (None if no generation)
         """
-        # Get uids, actions and keep_counts from batch
+        # Get uids and actions from batch
         uids = batch.non_tensor_batch.get("uid", [])
         uids = np.asarray(uids) if not isinstance(uids, np.ndarray) else uids
         actions = batch.non_tensor_batch.get("action", [])
-        keep_counts = batch.non_tensor_batch.get("keep_count", [])
         problem_ids = batch.non_tensor_batch.get("problem_id", [])
         levels = batch.non_tensor_batch.get("level", [])
         super_uids = batch.non_tensor_batch.get("super_uid", [])
@@ -669,16 +669,15 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # Initialize counters for metrics
         action_counts = {
-            'keep': 0,
-            'replace': 0,
+            'drop': 0,
             'add_in_context_knowledge': 0,
-            'add_in_context_knowledge_success': 0
+            'add_in_context_knowledge_success': 0,
+            'new_problems_appended': 0,
         }
 
        
         # Aggregate actions by uid (since batch contains multiple rollouts per prompt)
         uid_to_action = {}
-        uid_to_keep_count = {}
         uid_to_problem_id = {}
         uid_to_level = {}
         uid_to_super_uid ={}
@@ -686,7 +685,6 @@ class RayDAPOTrainer(RayPPOTrainer):
         for i, uid in enumerate(uids):
             if uid not in uid_to_action and uid in keep_uids:
                 uid_to_action[uid] = actions[i] if i < len(actions) else "keep"
-                uid_to_keep_count[uid] = keep_counts[i] if i < len(keep_counts) else 0
                 uid_to_problem_id[uid] = problem_ids[i]
                 uid_to_level[uid] =int(levels[i])
                 if len(super_uids) > 0:
@@ -708,10 +706,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         for action in uid_to_action.values():
             if action == 'add_in_context_knowledge':
                 action_counts['add_in_context_knowledge'] += 1
-            elif action == 'replace':
-                action_counts['replace'] += 1
-            elif action == 'keep':
-                action_counts['keep'] += 1
+            else:
+                action_counts['drop'] += 1
 
         # We need original problem data - this should be stored in the batch
         # For now, assume we can reconstruct or access original problems
@@ -736,7 +732,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                 original_problem_data = self.get_item_from_all_train(problem_id)
                 generation_problem = {
                     'problem': original_problem_data.get('extra_info', {}).get('question', ''),
-                    'answer': original_problem_data.get('extra_info', {}).get('answer', ''),
                     'action': action
                     }
                 all_problems.append(generation_problem)
@@ -766,116 +761,66 @@ class RayDAPOTrainer(RayPPOTrainer):
         
 
         for uid, action in uid_to_action.items():
-            keep_count = uid_to_keep_count.get(uid, 0)
             problem_id = uid_to_problem_id.get(uid, 0)
             level = uid_to_level.get(uid, 0)
 
-            if action == 'keep':
-                original_problem_data = self.get_item_from_all_train(problem_id)
-                updated_problems.append({
-                    **original_problem_data,
-                    "action": "keep",
-                    "keep_count": keep_count+1,
-                    "problem_id":problem_id,
-                    "level":level,
-                    "data_source":"general-reasoner",
-                    "super_uid":"none"
-                })
-
-            elif action == 'replace':
-                new_problem = self.get_item_from_all_train(current_next_id)
-                updated_problems.append({
-                    **new_problem,
-                    "action": "keep",
-                    "keep_count": 0,
-                    "problem_id":problem_id,
-                    "level":0,
-                    "data_source":"general-reasoner",
-                    "super_uid":"none"
-                })
-                current_next_id += 1
-
-            elif action == 'add_in_context_knowledge':
+            if action == 'add_in_context_knowledge':
                 original_problem_data = self.get_item_from_all_train(problem_id)
 
                 if uid in generated_variants:
-                    # Pick first valid variant from the N variants for this prompt
-                    variant_action, variant = None, None
+                    # Keep all generated variants for this prompt.
                     for va, v in generated_variants[uid]:
                         variant_action, variant = va, v
                         super_uid = str(uuid.uuid4())
-                        if v.get('problem') and v.get('answer'):
-                            if variant_action is not None and variant and variant['problem'] and variant['answer']:
-                                new_level = level
-                                new_item = {
-                                    **original_problem_data,
-                                    "prompt": [
-                                        {
-                                            "role": "system",
-                                            "content": "Please reason step by step, and put your final answer within \\boxed{{}}.",
-                                        },
-                                        {
-                                            "role": "user",
-                                            "content": str(variant['problem']),
-                                        }
-                                    ],
-                                    "action": "keep",
-                                    "keep_count": keep_count,
-                                    "problem_id": problem_id,
-                                    "level": new_level,
-                                    "data_source": str(variant['uid']),
-                                    "super_uid":super_uid
-                                }
-                                updated_problems.append(new_item)
-                                self.pending_super_uid_to_new_item[super_uid]= new_item
-
-                                generated_samples.append({
-                                    "super_uid": super_uid,
-                                    "problem_id": uid_to_problem_id.get(uid, 0),
-                                    "level": new_level,
-                                    "parsed_success": True,
-                                })
-                            else:
-                                new_item ={
-                                    **original_problem_data,
-                                    "action": "keep",
-                                    "keep_count": keep_count+1,
-                                    "problem_id":problem_id,
-                                    "level":level,
-                                    "data_source": str(variant['uid']),
-                                    "super_uid":super_uid
-                                }
-                                updated_problems.append(new_item)
-                                self.pending_super_uid_to_new_item[super_uid]= new_item
-
-                                generated_samples.append({
-                                    "super_uid": super_uid,
-                                    "problem_id": uid_to_problem_id.get(uid, 0),
-                                    "level": level,
-                                    "parsed_success": False,
-                                })
-                        else:
-                            new_item ={
+                        if variant_action is not None and variant and variant.get('problem'):
+                            new_item = {
                                 **original_problem_data,
+                                "prompt": [
+                                    {
+                                        "role": "system",
+                                        "content": "Please reason step by step, and put your final answer within \\boxed{{}}.",
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": str(variant['problem']),
+                                    }
+                                ],
                                 "action": "keep",
-                                "keep_count": keep_count+1,
-                                "problem_id":problem_id,
-                                "level":level,
+                                "keep_count": 0,
+                                "problem_id": problem_id,
+                                "level": level,
                                 "data_source": str(variant['uid']),
-                                "super_uid":super_uid
+                                "super_uid": super_uid
                             }
                             updated_problems.append(new_item)
-                            self.pending_super_uid_to_new_item[super_uid]= new_item
+                            self.pending_super_uid_to_new_item[super_uid] = new_item
 
                             generated_samples.append({
                                 "super_uid": super_uid,
                                 "problem_id": uid_to_problem_id.get(uid, 0),
                                 "level": level,
-                                "parsed_success": False,
+                                "parsed_success": bool(variant.get("knowledge")),
                             })
+                        # If action doesn't need add_knowledge, that prompt is dropped entirely.
                         
                 else:
                     raise ValueError(f"Unexpect error for {original_problem_data}")
+
+        # After each round, append batch_size new problems from the dataset tail.
+        batch_size_to_add = len(uid_to_action)
+        for _ in range(batch_size_to_add):
+            new_problem = self.get_item_from_all_train(current_next_id)
+            updated_problems.append({
+                **new_problem,
+                "action": "keep",
+                "keep_count": 0,
+                "problem_id": current_next_id,
+                "level": 0,
+                "data_source": "general-reasoner",
+                "super_uid": "none"
+            })
+            current_next_id += 1
+        action_counts["new_problems_appended"] = batch_size_to_add
 
         return updated_problems, current_next_id, action_counts, generated_samples, pending_generated_batch
         
@@ -904,7 +849,6 @@ class RayDAPOTrainer(RayPPOTrainer):
     def update_action(self, batch: DataProto):
         """
         Update actions for prompts based on their reward scores.
-        Actions and keep_count are stored directly in the batch data.
         Rewards are aggregated by uid since batch contains multiple rollouts per prompt.
 
         Args:
@@ -939,46 +883,24 @@ class RayDAPOTrainer(RayPPOTrainer):
         # Store for Phase 0 in update_problems (cleanup by data_source)
         batch.meta_info["uid_to_avg_reward"] = uid_to_avg_reward  # also in meta_info so it survives batch split
 
-        # Get current actions and keep_counts (these should be per-uid, not per-sample)
         # Since batch is expanded, we need to get unique uids and their corresponding actions
         unique_uids = list(uid_to_avg_reward.keys())
-
-        # For actions and keep_counts, we assume they are stored per-uid
-        # If not available, initialize with defaults
-        current_actions = {}
-        current_keep_counts = {}
-
-        # Try to get existing actions and keep_counts from batch
-        batch_actions = batch.non_tensor_batch.get("action", [])
-        batch_keep_counts = batch.non_tensor_batch.get("keep_count", [])
-
-        # Map existing actions/keep_counts to uids (if available)
-        for i, uid in enumerate(uids[:len(batch_actions)]):
-            current_actions[uid] = batch_actions[i]
-            current_keep_counts[uid] = batch_keep_counts[i] if i < len(batch_keep_counts) else 0
 
         add_knowledge_threshold = getattr(
             self.config.data,
             'add_in_context_knowledge_threshold',
             getattr(self.config.data, 'degrade_threshold', -0.2),
         )
-        keep_max = getattr(self.config.data, 'keep_max', 0)
-
         updated_actions = []
 
         # Process each unique uid
         for uid in unique_uids:
             avg_reward = uid_to_avg_reward[uid]
-            current_keep_count = current_keep_counts.get(uid, 0)
-
             # Update action based on average reward for this uid
             if avg_reward < add_knowledge_threshold:
                 new_action = 'add_in_context_knowledge'
-            elif current_keep_count >= keep_max:
-                new_action = 'replace'
             else:
-                # Keep action
-                new_action = 'keep'
+                new_action = 'drop'
 
             # Store per-uid results
             updated_actions.append(new_action)
@@ -992,8 +914,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 idx = unique_uids.index(uid)
                 batch_updated_actions.append(updated_actions[idx])
             else:
-                # Fallback for uids not in our processing
-                batch_updated_actions.append("keep")
+                batch_updated_actions.append("drop")
 
         # Add assertion to verify dimensions match
         assert len(batch_updated_actions) == len(uids), f"Action length mismatch: {len(batch_updated_actions)} vs {len(uids)}"
