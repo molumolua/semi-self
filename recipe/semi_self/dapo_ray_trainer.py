@@ -144,22 +144,17 @@ class RayDAPOTrainer(RayPPOTrainer):
         added_batch = None
         num_prompt_in_batch = 0
         
-        # TODO: 当难度出现反复时，
-        self.all_train_object =[]
+        # One entry per dataset row: current training snapshot for that problem_id.
+        self.all_train_object = []
         for item in self.train_dataset.dataframe:
-            self.all_train_object.append({
-                "level":0,
-                "dict":{
-                    0:item
-                    }
-                })
+            self.all_train_object.append(dict(item))
         # Get train problems directly from the raw dataframe (not processed data)
         # since InMemoryRLHFDataset expects raw data with 'prompt' field
         train_problems = []
         for i in range(min(self.config.data.train_batch_size, len(self.train_dataset))):
             # Get raw data from dataframe, not processed data from __getitem__
             problem = dict(self.train_dataset.dataframe[i])
-            train_problems.append({**problem,"action":"keep","keep_count":0,"problem_id":i,"level":0})
+            train_problems.append({**problem, "action": "keep", "problem_id": i})
 
 
         inmemory_dataloader=self.createInmemoryDataLoader(train_problems)
@@ -241,7 +236,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 # update train_problems and inmemory_dataloader
                 # Use the current batch (which contains uids and updated actions from update_action)
-                # The batch should already have the correct actions and keep_counts from update_action
+                # The batch should already have the correct actions from update_action
                 timing_raw = defaultdict(float)
                 with marked_timer("update_problems", timing_raw, "blue"):
                     # original_batch 有一些是updated_problems,这些updated_problems如果不管控，那么batch_sizeh会越来越大。
@@ -273,22 +268,104 @@ class RayDAPOTrainer(RayPPOTrainer):
             metrics = {f"timing/{k}": v for k, v in timing_raw.items()}
             logger.log(data=metrics, step=self.global_steps)
 
-    def get_item_from_all_train(self,problem_id):
-        object = self.all_train_object[problem_id]
-        return object['dict'][object['level']]
-    def update_item_for_all_train(self,problem_id,level,item):
-        self.all_train_object[problem_id]['dict'][level]=item
+    def get_item_from_all_train(self, problem_id):
+        return self.all_train_object[problem_id]
 
-    def train_batch(self, batch_dict, prev_step_profile, curr_step_profile,  timing_raw):
-        metrics = {}
+    def update_item_for_all_train(self, problem_id, item):
+        self.all_train_object[problem_id] = item
 
-        with marked_timer("start_profile", timing_raw):
-            self._start_profiling(
-                not prev_step_profile and curr_step_profile
-                if self.config.global_profiler.profile_continuous_steps
-                else curr_step_profile
-            )
+    def _merge_pending_generated_batch_into_train_batch(self, new_batch: DataProto) -> DataProto:
+        """
+        Merge pending generation rollout batch (from previous step's add_in_context_knowledge)
+        into the current train batch `new_batch`, assigning gen-step rewards from verifier acc.
 
+        Uses super_uid -> average acc on the current `new_batch` to score generated samples
+        where parse succeeded; parse failures get a fixed penalty.
+        """
+        # super_uid -> average acc (for gen-step reward)
+        super_uid_to_acc = {}
+        acc_vals = new_batch.non_tensor_batch.get("acc", None)
+        super_uids = new_batch.non_tensor_batch.get("super_uid", None)
+        if acc_vals is not None and super_uids is not None:
+            acc_vals = np.asarray(acc_vals, dtype=np.float32)
+            super_uid_to_acc_list = {}
+            for i in range(len(super_uids)):
+                sid = super_uids[i]
+                if sid is not None and str(sid).strip() != "":
+                    sid = str(sid)
+                    if i < len(acc_vals):
+                        super_uid_to_acc_list.setdefault(sid, []).append(float(acc_vals[i]))
+            for sid, a_list in super_uid_to_acc_list.items():
+                super_uid_to_acc[sid] = sum(a_list) / len(a_list)
+
+        if getattr(self, "pending_generated_batch", None) is None or getattr(
+            self, "pending_generated_samples", None
+        ) is None:
+            return new_batch
+
+        pending_batch = self.pending_generated_batch
+        pending_samples = self.pending_generated_samples
+        if len(pending_samples) > 0 and pending_batch.batch["attention_mask"].shape[0] == len(pending_samples):
+            device = pending_batch.batch["attention_mask"].device
+            response_length = int(pending_batch.batch["responses"].shape[1])
+            token_level_rewards_list = []
+            keep_indices = []
+            for i, info in enumerate(pending_samples):
+                super_uid = info["super_uid"]
+                parsed_success = info["parsed_success"]
+                if not parsed_success:
+                    r_gen = -0.5
+                else:
+                    if super_uid not in super_uid_to_acc:
+                        continue
+                    acc = super_uid_to_acc[super_uid]
+                    r_gen = 1.0 - 2.0 * abs(acc - 0.5)
+                keep_indices.append(i)
+                valid_response_len = int(pending_batch.batch["attention_mask"][i, -response_length:].sum().item())
+                last_pos_in_response = valid_response_len - 1
+                r_vec = torch.zeros(response_length, device=device, dtype=torch.float32)
+                if last_pos_in_response >= 0:
+                    r_vec[last_pos_in_response] = float(r_gen)
+                token_level_rewards_list.append(r_vec.unsqueeze(0))
+            if keep_indices:
+                idx = torch.tensor(keep_indices, dtype=torch.long, device=device)
+                sub_batch = {k: v.index_select(0, idx) for k, v in pending_batch.batch.items()}
+                sub_non_tensor = {k: np.array(v)[keep_indices] for k, v in pending_batch.non_tensor_batch.items()}
+                token_level_rewards = torch.cat(token_level_rewards_list, dim=0)
+                sub_batch["rm_scores"] = token_level_rewards
+                sub_batch["token_level_scores"] = token_level_rewards
+                sub_batch["token_level_rewards"] = token_level_rewards
+                sub_batch_td = TensorDict(source=sub_batch, batch_size=[len(keep_indices)])
+                added_batch = DataProto(
+                    batch=sub_batch_td,
+                    non_tensor_batch=sub_non_tensor,
+                    meta_info=dict(pending_batch.meta_info),
+                )
+                added_batch.non_tensor_batch["uid"] = np.array(
+                    [f"gen_{i}" for i in range(len(keep_indices))], dtype=object
+                )
+                for k in new_batch.non_tensor_batch.keys():
+                    if k not in added_batch.non_tensor_batch:
+                        added_batch.non_tensor_batch[k] = np.array([None] * len(keep_indices), dtype=object)
+                n_orig = new_batch.batch["attention_mask"].shape[0]
+                new_batch.non_tensor_batch["_batch_source"] = np.array(["original"] * n_orig, dtype=object)
+                added_batch.non_tensor_batch["_batch_source"] = np.array(["added"] * len(keep_indices), dtype=object)
+                new_batch = DataProto.concat([new_batch, added_batch])
+
+            self.pending_generated_batch = None
+            self.pending_generated_samples = None
+        else:
+            if len(pending_samples) > 0:
+                raise ValueError(
+                    f'{pending_batch.batch["attention_mask"].shape[0]} != {len(pending_samples)}'
+                )
+
+        return new_batch
+
+    def _rollout_and_compute_reward(self, batch_dict, metrics, timing_raw):
+        """
+        Rollout, RM / rule reward, update_action, merge pending gen batch -> training `batch`.
+        """
         new_batch: DataProto = DataProto.from_single_dict(batch_dict)
         # pop those keys for generation
         if "multi_modal_data" in new_batch.non_tensor_batch.keys():
@@ -305,287 +382,232 @@ class RayDAPOTrainer(RayPPOTrainer):
             repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
         )
 
-        
+        # generate a batch
+        with marked_timer("gen", timing_raw, "red"):
+            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+            timing_raw.update(gen_batch_output.meta_info["timing"])
+            gen_batch_output.meta_info.pop("timing", None)
 
-        with marked_timer("step", timing_raw):
-            # generate a batch
-            with marked_timer("gen", timing_raw, "red"):
-                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                timing_raw.update(gen_batch_output.meta_info["timing"])
-                gen_batch_output.meta_info.pop("timing", None)
+        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+            with marked_timer("gen_max", timing_raw, "red"):
+                gen_baseline_batch = deepcopy(gen_batch)
+                gen_baseline_batch.meta_info["do_sample"] = False
+                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
-            if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                with marked_timer("gen_max", timing_raw, "red"):
-                    gen_baseline_batch = deepcopy(gen_batch)
-                    gen_baseline_batch.meta_info["do_sample"] = False
-                    gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-
-                    new_batch = new_batch.union(gen_baseline_output)
-                    # compute reward model score on new_batch
-                    rm_scores = None
-                    if self.use_rm and "rm_scores" not in new_batch.batch.keys():
-                        rm_scores = self.rm_wg.compute_rm_score(new_batch)
-                        new_batch = new_batch.union(rm_scores)
-                    reward_baseline_tensor, _ = compute_reward(new_batch, self.reward_fn)
-                    reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                    keys_to_pop = set(gen_baseline_output.batch.keys())
-                    if rm_scores is not None:
-                        keys_to_pop.update(rm_scores.batch.keys())
-                    new_batch.pop(batch_keys=list(keys_to_pop))
-
-                    new_batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                    del rm_scores, gen_baseline_batch, gen_baseline_output
-
-            new_batch.non_tensor_batch["uid"] = np.array(
-                [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
-            )
-            # repeat to align with repeated responses in rollout
-            new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-            new_batch = new_batch.union(gen_batch_output)
-
-            if self.config.algorithm.use_kl_in_reward:
-                # We need these metrics for apply_kl_penalty if using kl in reward
-                new_batch = self.compute_kl_related_metrics(new_batch, metrics, timing_raw)
-                # otherwise, we will compute those after dynamic sampling
-
-            with marked_timer("reward", timing_raw, "yellow"):
-                # compute scores. Support both model and function-based.
-                # We first compute the scores using reward model. Then, we call reward_fn to combine
-                # the results from reward model and rule-based results.
+                new_batch = new_batch.union(gen_baseline_output)
+                # compute reward model score on new_batch
+                rm_scores = None
                 if self.use_rm and "rm_scores" not in new_batch.batch.keys():
-                    # we first compute reward model score
-                    reward_tensor = self.rm_wg.compute_rm_score(new_batch)
-                    new_batch = new_batch.union(reward_tensor)
+                    rm_scores = self.rm_wg.compute_rm_score(new_batch)
+                    new_batch = new_batch.union(rm_scores)
+                reward_baseline_tensor, _ = compute_reward(new_batch, self.reward_fn)
+                reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
-                # we combine with rule-based rm
-                reward_tensor, reward_extra_infos_dict = compute_reward(new_batch, self.reward_fn)
+                keys_to_pop = set(gen_baseline_output.batch.keys())
+                if rm_scores is not None:
+                    keys_to_pop.update(rm_scores.batch.keys())
+                new_batch.pop(batch_keys=list(keys_to_pop))
 
-                new_batch.batch["token_level_scores"] = reward_tensor
+                new_batch.batch["reward_baselines"] = reward_baseline_tensor
 
-                if reward_extra_infos_dict:
-                    new_batch.non_tensor_batch.update(
-                        {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
-                    )
+                del rm_scores, gen_baseline_batch, gen_baseline_output
 
-                # compute rewards. apply_kl_penalty if available
-                if self.config.algorithm.use_kl_in_reward:
-                    new_batch, kl_metrics = apply_kl_penalty(
-                        new_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                    )
-                    metrics.update(
-                        kl_metrics
-                    )  # TODO: This will be cleared if we use multiple genenration batches
-                else:
-                    new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
+        new_batch.non_tensor_batch["uid"] = np.array(
+            [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
+        )
+        # repeat to align with repeated responses in rollout
+        new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+        new_batch = new_batch.union(gen_batch_output)
 
-            # Update actions based on reward scores
-            self.update_action(new_batch)
+        if self.config.algorithm.use_kl_in_reward:
+            # We need these metrics for apply_kl_penalty if using kl in reward
+            new_batch = self.compute_kl_related_metrics(new_batch, metrics, timing_raw)
+            # otherwise, we will compute those after dynamic sampling
 
-            # Compute super_uid -> average acc for samples from generated problems (for gen-step reward)
-            super_uid_to_acc = {}
-            acc_vals = new_batch.non_tensor_batch.get("acc", None)
-            super_uids = new_batch.non_tensor_batch.get("super_uid", None)
-            if acc_vals is not None and super_uids is not None:
-                acc_vals = np.asarray(acc_vals, dtype=np.float32)
-                super_uid_to_acc_list = {}
-                for i in range(len(super_uids)):
-                    sid = super_uids[i]
-                    if sid is not None and str(sid).strip() != "":
-                        sid = str(sid)
-                        if i < len(acc_vals):
-                            super_uid_to_acc_list.setdefault(sid, []).append(float(acc_vals[i]))
-                for sid, a_list in super_uid_to_acc_list.items():
-                    super_uid_to_acc[sid] = sum(a_list) / len(a_list)
+        reward_extra_infos_dict = {}
+        with marked_timer("reward", timing_raw, "yellow"):
+            # compute scores. Support both model and function-based.
+            # We first compute the scores using reward model. Then, we call reward_fn to combine
+            # the results from reward model and rule-based results.
+            if self.use_rm and "rm_scores" not in new_batch.batch.keys():
+                # we first compute reward model score
+                reward_tensor = self.rm_wg.compute_rm_score(new_batch)
+                new_batch = new_batch.union(reward_tensor)
 
-            # Merge pending generated batch (from previous step's add_in_context_knowledge) with rewards for PPO
-            if getattr(self, "pending_generated_batch", None) is not None and getattr(self, "pending_generated_samples", None):
-                pending_batch = self.pending_generated_batch
-                pending_samples = self.pending_generated_samples
-                if len(pending_samples) > 0 and pending_batch.batch["attention_mask"].shape[0] == len(pending_samples):
-                    device = pending_batch.batch["attention_mask"].device
-                    dtype = pending_batch.batch["attention_mask"].dtype
-                    # Reward-related tensors must be response_length only (match new_batch / fsdp _expand_to_token_level)
-                    response_length = int(pending_batch.batch["responses"].shape[1])
-                    token_level_rewards_list = []
-                    keep_indices = []
-                    for i, info in enumerate(pending_samples):
-                        super_uid = info["super_uid"]
-                        parsed_success = info["parsed_success"]
-                        if not parsed_success:
-                            r_gen = -0.5
-                        else:
-                            if super_uid not in super_uid_to_acc:
-                                continue
-                            acc = super_uid_to_acc[super_uid]
-                            r_gen = 1.0 - 2.0 * abs(acc - 0.5)
-                        keep_indices.append(i)
-                        # Last valid position within response part only (not full sequence)
-                        valid_response_len = int(pending_batch.batch["attention_mask"][i, -response_length:].sum().item())
-                        last_pos_in_response = valid_response_len - 1
-                        r_vec = torch.zeros(response_length, device=device, dtype=torch.float32)
-                        if last_pos_in_response >= 0:
-                            r_vec[last_pos_in_response] = float(r_gen)
-                        token_level_rewards_list.append(r_vec.unsqueeze(0))
-                    if keep_indices:
-                        idx = torch.tensor(keep_indices, dtype=torch.long, device=device)
-                        sub_batch = {k: v.index_select(0, idx) for k, v in pending_batch.batch.items()}
-                        sub_non_tensor = {k: np.array(v)[keep_indices] for k, v in pending_batch.non_tensor_batch.items()}
-                        token_level_rewards = torch.cat(token_level_rewards_list, dim=0)
-                        # Reward tensors: response_length only (same as new_batch / fsdp _expand_to_token_level)
-                        sub_batch["rm_scores"] = token_level_rewards
-                        sub_batch["token_level_scores"] = token_level_rewards
-                        sub_batch["token_level_rewards"] = token_level_rewards
-                        sub_batch_td = TensorDict(source=sub_batch, batch_size=[len(keep_indices)])
-                        added_batch = DataProto(batch=sub_batch_td, non_tensor_batch=sub_non_tensor, meta_info=dict(pending_batch.meta_info))
-                        added_batch.non_tensor_batch["uid"] = np.array([f"gen_{i}" for i in range(len(keep_indices))], dtype=object)
-                        for k in new_batch.non_tensor_batch.keys():
-                            if k not in added_batch.non_tensor_batch:
-                                added_batch.non_tensor_batch[k] = np.array([None] * len(keep_indices), dtype=object)
-                        # Mark source so we can split original vs added at return
-                        n_orig = new_batch.batch["attention_mask"].shape[0]
-                        new_batch.non_tensor_batch["_batch_source"] = np.array(["original"] * n_orig, dtype=object)
-                        added_batch.non_tensor_batch["_batch_source"] = np.array(["added"] * len(keep_indices), dtype=object)
-                        new_batch = DataProto.concat([new_batch, added_batch])
-                    
-                    self.pending_generated_batch = None
-                    self.pending_samples = None
-                else:
-                    if len(pending_samples) > 0:
-                        raise ValueError(f'{pending_batch.batch["attention_mask"].shape[0]} != {len(pending_samples)}')
+            # we combine with rule-based rm
+            reward_tensor, reward_extra_infos_dict = compute_reward(new_batch, self.reward_fn)
 
-            if not self.config.algorithm.filter_groups.enable:
-                batch = new_batch
-                if "_batch_source" not in batch.non_tensor_batch:
-                    batch.non_tensor_batch["_batch_source"] = np.array(
-                        ["original"] * batch.batch["attention_mask"].shape[0], dtype=object
-                    )
-            else:
-                raise NotImplementedError("Filter groups are not supported for semi-self.")
-                            
-        
+            new_batch.batch["token_level_scores"] = reward_tensor
 
-            # === Updating ===
-            # Balance the number of valid tokens across DP ranks.
-            # NOTE: This usually changes the order of data in the `batch`,
-            # which won't affect the advantage calculation (since it's based on uid),
-            # but might affect the loss calculation (due to the change of mini-batching).
-            # TODO: Decouple the DP balancing and mini-batching.
-            # Skip when batch_size is not divisible by world_size (e.g. semi-self merged batch 2052 % 8).
-            # world_size = self.actor_rollout_wg.world_size
-            # batch_size = batch.batch["attention_mask"].shape[0]
-            # pad_size = 0
-            # if batch_size % world_size != 0:
-            #     # Pad so DP chunk (e.g. compute_log_prob) can split evenly; trim before advantage.
-            #     batch, pad_size = pad_dataproto_to_divisor(batch, world_size)
-            if self.config.trainer.balance_batch:
-                self._balance_batch(batch, metrics=metrics)
-
-            # compute global_valid tokens
-            batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-            if not self.config.algorithm.use_kl_in_reward:
-                batch = self.compute_kl_related_metrics(batch, metrics, timing_raw)
-
-            # compute values
-            if self.use_critic:
-                with marked_timer("values", timing_raw, "cyan"):
-                    values = self.critic_wg.compute_values(batch)
-                    batch = batch.union(values)
-
-            # Compute rollout correction weights and off-policy metrics (inherited from RayPPOTrainer)
-            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
-
-            rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-            if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
-                batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch)
-                # IS and off-policy metrics already have rollout_corr/ prefix
-                metrics.update(is_metrics)
-
-            with marked_timer("adv", timing_raw, "brown"):
-                # # Remove padding added for DP chunking so advantage is only over real samples.
-                # if pad_size > 0:
-                #     original_len = len(batch) - pad_size
-                #     batch = batch.select_idxs(list(range(original_len)))
-                #     batch.meta_info["global_token_num"] = batch.meta_info["global_token_num"][:original_len]
-                # compute advantages, executed on the driver process
-                norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
-                batch = compute_advantage(
-                    batch,
-                    adv_estimator=self.config.algorithm.adv_estimator,
-                    gamma=self.config.algorithm.gamma,
-                    lam=self.config.algorithm.lam,
-                    num_repeat=self.config.actor_rollout_ref.rollout.n,
-                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            if reward_extra_infos_dict:
+                new_batch.non_tensor_batch.update(
+                    {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
                 )
 
-            # update critic
-            if self.use_critic:
-                with marked_timer("update_critic", timing_raw, "pink"):
-                    critic_output = self.critic_wg.update_critic(batch)
-                critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                metrics.update(critic_output_metrics)
-
-            # implement critic warmup
-            if self.config.trainer.critic_warmup <= self.global_steps:
-                # update actor
-                with marked_timer("update_actor", timing_raw, "red"):
-                    # For normalize_update_by_reference_batch_size: so K-sample update matches T-sample effect
-                    batch.meta_info["actual_global_batch_size"] = batch.batch["attention_mask"].shape[0]
-                    batch.meta_info["reference_batch_size"] = (
-                        self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
-                    )
-                    # 也把这两个信息打到 metrics 里，方便在 logger 中查看
-                    metrics["train/actual_global_batch_size"] = batch.meta_info["actual_global_batch_size"]
-                    metrics["train/reference_batch_size"] = batch.meta_info["reference_batch_size"]
-                    actor_output = self.actor_rollout_wg.update_actor(batch)
-                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                metrics.update(actor_output_metrics)
-
-            # Log rollout generations if enabled
-            rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-            if rollout_data_dir:
-                self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-
-            # Split batch into original and added (from pending generated) for separate return
-            src = batch.non_tensor_batch.get("_batch_source", None)
-            if src is not None:
-                src = np.asarray(src)
-                orig_idx = np.where(src == "original")[0]
-                add_idx = np.where(src == "added")[0]
-                device = batch.batch["attention_mask"].device
-                if len(orig_idx) > 0:
-                    o_idx = torch.tensor(orig_idx, dtype=torch.long, device=device)
-                    orig_batch_dict = {
-                        k: v.index_select(0, o_idx) for k, v in batch.batch.items()
-                    }
-                    orig_batch = TensorDict(source=orig_batch_dict, batch_size=[len(orig_idx)])
-                    orig_non = {k: np.array(v)[orig_idx] for k, v in batch.non_tensor_batch.items() if k != "_batch_source"}
-                    original_batch = DataProto(batch=orig_batch, non_tensor_batch=orig_non, meta_info=dict(batch.meta_info))
-                else:
-                    original_batch = None
-                if len(add_idx) > 0:
-                    a_idx = torch.tensor(add_idx, dtype=torch.long, device=device)
-                    add_batch_dict = {
-                        k: v.index_select(0, a_idx) for k, v in batch.batch.items()
-                    }
-                    add_batch = TensorDict(source=add_batch_dict, batch_size=[len(add_idx)])
-                    add_non = {k: np.array(v)[add_idx] for k, v in batch.non_tensor_batch.items() if k != "_batch_source"}
-                    added_batch = DataProto(batch=add_batch, non_tensor_batch=add_non, meta_info=dict(batch.meta_info))
-                else:
-                    added_batch = None
+            # compute rewards. apply_kl_penalty if available
+            if self.config.algorithm.use_kl_in_reward:
+                new_batch, kl_metrics = apply_kl_penalty(
+                    new_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                )
+                metrics.update(
+                    kl_metrics
+                )  # TODO: This will be cleared if we use multiple genenration batches
             else:
-                original_batch = batch
+                new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
+
+
+
+        if not self.config.algorithm.filter_groups.enable:
+            batch = new_batch
+            if "_batch_source" not in batch.non_tensor_batch:
+                batch.non_tensor_batch["_batch_source"] = np.array(
+                    ["original"] * batch.batch["attention_mask"].shape[0], dtype=object
+                )
+        else:
+            raise NotImplementedError("Filter groups are not supported for semi-self.")
+
+        return batch, reward_extra_infos_dict
+
+    def _compute_advantage_and_backward(self, batch, metrics, timing_raw, reward_extra_infos_dict):
+        """
+        Balance batch, KL metrics, values, advantage, critic/actor update, logging, split return.
+        """
+        # === Updating ===
+        # Balance the number of valid tokens across DP ranks.
+        # NOTE: This usually changes the order of data in the `batch`,
+        # which won't affect the advantage calculation (since it's based on uid),
+        # but might affect the loss calculation (due to the change of mini-batching).
+        # TODO: Decouple the DP balancing and mini-batching.
+        # Skip when batch_size is not divisible by world_size (e.g. semi-self merged batch 2052 % 8).
+        # world_size = self.actor_rollout_wg.world_size
+        # batch_size = batch.batch["attention_mask"].shape[0]
+        # pad_size = 0
+        # if batch_size % world_size != 0:
+        #     # Pad so DP chunk (e.g. compute_log_prob) can split evenly; trim before advantage.
+        #     batch, pad_size = pad_dataproto_to_divisor(batch, world_size)
+        if self.config.trainer.balance_batch:
+            self._balance_batch(batch, metrics=metrics)
+
+        # compute global_valid tokens
+        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+        if not self.config.algorithm.use_kl_in_reward:
+            batch = self.compute_kl_related_metrics(batch, metrics, timing_raw)
+
+        # compute values
+        if self.use_critic:
+            with marked_timer("values", timing_raw, "cyan"):
+                values = self.critic_wg.compute_values(batch)
+                batch = batch.union(values)
+
+        # Compute rollout correction weights and off-policy metrics (inherited from RayPPOTrainer)
+        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
+            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch)
+            # IS and off-policy metrics already have rollout_corr/ prefix
+            metrics.update(is_metrics)
+
+        with marked_timer("adv", timing_raw, "brown"):
+            # # Remove padding added for DP chunking so advantage is only over real samples.
+            # if pad_size > 0:
+            #     original_len = len(batch) - pad_size
+            #     batch = batch.select_idxs(list(range(original_len)))
+            #     batch.meta_info["global_token_num"] = batch.meta_info["global_token_num"][:original_len]
+            # compute advantages, executed on the driver process
+            norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+            batch = compute_advantage(
+                batch,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
+
+        # update critic
+        if self.use_critic:
+            with marked_timer("update_critic", timing_raw, "pink"):
+                critic_output = self.critic_wg.update_critic(batch)
+            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+            metrics.update(critic_output_metrics)
+
+        # implement critic warmup
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            # update actor
+            with marked_timer("update_actor", timing_raw, "red"):
+                # For normalize_update_by_reference_batch_size: so K-sample update matches T-sample effect
+                batch.meta_info["actual_global_batch_size"] = batch.batch["attention_mask"].shape[0]
+                batch.meta_info["reference_batch_size"] = (
+                    self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+                )
+                # 也把这两个信息打到 metrics 里，方便在 logger 中查看
+                metrics["train/actual_global_batch_size"] = batch.meta_info["actual_global_batch_size"]
+                metrics["train/reference_batch_size"] = batch.meta_info["reference_batch_size"]
+                actor_output = self.actor_rollout_wg.update_actor(batch)
+            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+            metrics.update(actor_output_metrics)
+
+        # Log rollout generations if enabled
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        if rollout_data_dir:
+            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+        # Split batch into original and added (from pending generated) for separate return
+        src = batch.non_tensor_batch.get("_batch_source", None)
+        if src is not None:
+            src = np.asarray(src)
+            orig_idx = np.where(src == "original")[0]
+            add_idx = np.where(src == "added")[0]
+            device = batch.batch["attention_mask"].device
+            if len(orig_idx) > 0:
+                o_idx = torch.tensor(orig_idx, dtype=torch.long, device=device)
+                orig_batch_dict = {
+                    k: v.index_select(0, o_idx) for k, v in batch.batch.items()
+                }
+                orig_batch = TensorDict(source=orig_batch_dict, batch_size=[len(orig_idx)])
+                orig_non = {k: np.array(v)[orig_idx] for k, v in batch.non_tensor_batch.items() if k != "_batch_source"}
+                original_batch = DataProto(batch=orig_batch, non_tensor_batch=orig_non, meta_info=dict(batch.meta_info))
+            else:
+                original_batch = None
+            if len(add_idx) > 0:
+                a_idx = torch.tensor(add_idx, dtype=torch.long, device=device)
+                add_batch_dict = {
+                    k: v.index_select(0, a_idx) for k, v in batch.batch.items()
+                }
+                add_batch = TensorDict(source=add_batch_dict, batch_size=[len(add_idx)])
+                add_non = {k: np.array(v)[add_idx] for k, v in batch.non_tensor_batch.items() if k != "_batch_source"}
+                added_batch = DataProto(batch=add_batch, non_tensor_batch=add_non, meta_info=dict(batch.meta_info))
+            else:
                 added_batch = None
+        else:
+            original_batch = batch
+            added_batch = None
 
-            if original_batch is not None and "_batch_source" in original_batch.non_tensor_batch:
-                original_batch.non_tensor_batch.pop("_batch_source", None)
-            if added_batch is not None and "_batch_source" in added_batch.non_tensor_batch:
-                added_batch.non_tensor_batch.pop("_batch_source", None)
+        if original_batch is not None and "_batch_source" in original_batch.non_tensor_batch:
+            original_batch.non_tensor_batch.pop("_batch_source", None)
+        if added_batch is not None and "_batch_source" in added_batch.non_tensor_batch:
+            added_batch.non_tensor_batch.pop("_batch_source", None)
 
-            return original_batch, added_batch, metrics
-        
+        return original_batch, added_batch, metrics
+
+    def train_batch(self, batch_dict, prev_step_profile, curr_step_profile,  timing_raw):
+        metrics = {}
+
+        with marked_timer("start_profile", timing_raw):
+            self._start_profiling(
+                not prev_step_profile and curr_step_profile
+                if self.config.global_profiler.profile_continuous_steps
+                else curr_step_profile
+            )
+
+        with marked_timer("step", timing_raw):
+            batch, reward_extra_infos_dict = self._rollout_and_compute_reward(batch_dict, metrics, timing_raw)
+            self.update_action(batch)
+            batch = self._merge_pending_generated_batch_into_train_batch(batch)
+            return self._compute_advantage_and_backward(batch, metrics, timing_raw, reward_extra_infos_dict)
+
     def createInmemoryDataLoader(self,train_problems):
         train_dataset = InMemoryRLHFDataset(
             data_list=train_problems,
@@ -627,7 +649,6 @@ class RayDAPOTrainer(RayPPOTrainer):
         uids = np.asarray(uids) if not isinstance(uids, np.ndarray) else uids
         actions = batch.non_tensor_batch.get("action", [])
         problem_ids = batch.non_tensor_batch.get("problem_id", [])
-        levels = batch.non_tensor_batch.get("level", [])
         super_uids = batch.non_tensor_batch.get("super_uid", [])
         
 
@@ -685,14 +706,12 @@ class RayDAPOTrainer(RayPPOTrainer):
         # Aggregate actions by uid (since batch contains multiple rollouts per prompt)
         uid_to_action = {}
         uid_to_problem_id = {}
-        uid_to_level = {}
-        uid_to_super_uid ={}
+        uid_to_super_uid = {}
         
         for i, uid in enumerate(uids):
             if uid not in uid_to_action and uid in keep_uids:
                 uid_to_action[uid] = actions[i] if i < len(actions) else "keep"
                 uid_to_problem_id[uid] = problem_ids[i]
-                uid_to_level[uid] =int(levels[i])
                 if len(super_uids) > 0:
                     uid_to_super_uid[uid]=super_uids[i]
                 
@@ -700,9 +719,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         
         for uid in best_uids:
             problem_id = uid_to_problem_id[uid]
-            level = uid_to_level[uid]
             super_uid = uid_to_super_uid[uid]
-            self.update_item_for_all_train(problem_id,level,self.pending_super_uid_to_new_item[super_uid])
+            self.update_item_for_all_train(problem_id, self.pending_super_uid_to_new_item[super_uid])
         
         self.pending_super_uid_to_new_item = {}
         
@@ -768,7 +786,6 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         for uid, action in uid_to_action.items():
             problem_id = uid_to_problem_id.get(uid, 0)
-            level = uid_to_level.get(uid, 0)
 
             if action == 'add_in_context_knowledge':
                 original_problem_data = self.get_item_from_all_train(problem_id)
@@ -792,9 +809,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                     }
                                 ],
                                 "action": "keep",
-                                "keep_count": 0,
                                 "problem_id": problem_id,
-                                "level": level,
                                 "data_source": str(variant['uid']),
                                 "super_uid": super_uid
                             }
@@ -804,7 +819,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                             generated_samples.append({
                                 "super_uid": super_uid,
                                 "problem_id": uid_to_problem_id.get(uid, 0),
-                                "level": level,
                                 "parsed_success": bool(variant.get("knowledge")),
                             })
                         # If action doesn't need add_knowledge, that prompt is dropped entirely.
@@ -812,21 +826,19 @@ class RayDAPOTrainer(RayPPOTrainer):
                 else:
                     raise ValueError(f"Unexpect error for {original_problem_data}")
 
-        # After each round, append batch_size new problems from the dataset tail.
-        batch_size_to_add = len(uid_to_action)
-        for _ in range(batch_size_to_add):
-            new_problem = self.get_item_from_all_train(current_next_id)
-            updated_problems.append({
-                **new_problem,
-                "action": "keep",
-                "keep_count": 0,
-                "problem_id": current_next_id,
-                "level": 0,
-                "data_source": "general-reasoner",
-                "super_uid": "none"
-            })
-            current_next_id += 1
-        action_counts["new_problems_appended"] = batch_size_to_add
+        # # After each round, append batch_size new problems from the dataset tail.
+        # batch_size_to_add = len(uid_to_action)
+        # for _ in range(batch_size_to_add):
+        #     new_problem = self.get_item_from_all_train(current_next_id)
+        #     updated_problems.append({
+        #         **new_problem,
+        #         "action": "keep",
+        #         "problem_id": current_next_id,
+        #         "data_source": "general-reasoner",
+        #         "super_uid": "none"
+        #     })
+        #     current_next_id += 1
+        # action_counts["new_problems_appended"] = batch_size_to_add
 
         return updated_problems, current_next_id, action_counts, generated_samples, pending_generated_batch
         
@@ -914,9 +926,9 @@ class RayDAPOTrainer(RayPPOTrainer):
             # Store per-uid results
             updated_actions.append(new_action)
 
-        # Update the batch with new actions and keep_counts (per-uid)
+        # Update the batch with new actions (per-uid)
         # Note: Since batch is expanded with multiple samples per uid, we need to
-        # replicate the per-uid actions/keep_counts for all samples of each uid
+        # replicate the per-uid actions for all samples of each uid
         batch_updated_actions = []
         for uid in uids:
             if uid in unique_uids:
