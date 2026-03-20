@@ -525,38 +525,46 @@ class RayDAPOTrainer(RayPPOTrainer):
                 else curr_step_profile
             )
 
-        timing_update_problems = defaultdict(float)
         pending_generated_batch = None
         action_counts = {}
 
         with marked_timer("step", timing_raw):
-            batch, reward_extra_infos_dict = self._rollout_and_compute_reward(batch_dict, metrics, timing_raw)
-            self.update_action(batch)
+            with marked_timer("train_batch/pass1_rollout_reward", timing_raw, "red"):
+                batch, reward_extra_infos_dict = self._rollout_and_compute_reward(batch_dict, metrics, timing_raw)
 
-            with marked_timer("update_problems", timing_update_problems, "blue"):
+            with marked_timer("train_batch/update_action", timing_raw, "blue"):
+                self.update_action(batch)
+
+            with marked_timer("train_batch/update_problems", timing_raw, "blue"):
                 (
                     train_problems,
                     action_counts,
                     pending_generated_batch,
                 ) = self.update_problems(batch)
 
+                metrics.update({f"semi_self/action_counts/{k}": v for k, v in action_counts.items()})
 
             # Pass 2: collate from updated `train_problems`, then same rollout + reward as Pass 1
-            batch_dict_with_knowledge = self.collate_single_batch_from_train_problems(train_problems)
-            batch_with_knowledge, reward_extra_infos_dict = self._rollout_and_compute_reward(
-                batch_dict_with_knowledge, metrics, timing_raw
-            )
+            with marked_timer("train_batch/pass2_collate", timing_raw, "blue"):
+                batch_dict_with_knowledge = self.collate_single_batch_from_train_problems(train_problems)
 
-            # Pass 3: attach last step's generated variants + rewards, then union Pass-1 and Pass-2 batches
-            batch_with_knowledge = self._merge_pending_generated_batch_into_train_batch(
-                batch_with_knowledge, pending_generated_batch
-            )
-            batch = batch.union(batch_with_knowledge)
+            with marked_timer("train_batch/pass2_rollout_reward", timing_raw, "red"):
+                batch_with_knowledge, reward_extra_infos_dict = self._rollout_and_compute_reward(
+                    batch_dict_with_knowledge, metrics, timing_raw
+                )
 
-            # Pass 4: advantage + PPO backward
-            batch, metrics = self._compute_advantage_and_backward(
-                batch, metrics, timing_raw, reward_extra_infos_dict
-            )
+            # Pass 3: attach generated variants + rewards, then union Pass-1 and Pass-2 batches
+            with marked_timer("train_batch/merge_and_union", timing_raw, "blue"):
+                batch_with_knowledge = self._merge_pending_generated_batch_into_train_batch(
+                    batch_with_knowledge, pending_generated_batch
+                )
+                batch = batch.union(batch_with_knowledge)
+
+            # Pass 4: advantage + PPO backward (inner stages also record into timing_raw)
+            with marked_timer("train_batch/ppo_backward", timing_raw, "pink"):
+                batch, metrics = self._compute_advantage_and_backward(
+                    batch, metrics, timing_raw, reward_extra_infos_dict
+                )
 
         return (
             batch,
