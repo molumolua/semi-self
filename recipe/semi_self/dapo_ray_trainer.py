@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-FSDP PPO Trainer with Ray-based single controller.
-This trainer supports model-agonistic model initialization with huggingface
+Ray single-controller trainer for DAPO / semi-self (extends VERL RayPPOTrainer).
+
+Model init is Hugging Face–centric and agnostic to specific model families.
 """
 
 import os
 import uuid
 from collections import defaultdict
+from typing import Optional
 from copy import deepcopy
 from pprint import pprint
 
@@ -27,7 +29,6 @@ import torch
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor
 from tensordict import TensorDict
 from torchdata.stateful_dataloader import StatefulDataLoader
 from verl.trainer.ppo.core_algos import agg_loss
@@ -40,7 +41,6 @@ from verl.trainer.ppo.ray_trainer import (
     compute_response_mask,
 )
 from verl.trainer.ppo.reward import compute_reward
-from verl.utils.dataset import inmemory_dataset
 from verl.utils.dataset.inmemory_dataset import InMemoryRLHFDataset
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
@@ -54,10 +54,13 @@ from verl.utils.model import compute_position_id_with_mask
                 
 class RayDAPOTrainer(RayPPOTrainer):
     """
-    Note that this trainer runs on the driver process on a single CPU/GPU node.
+    DAPO-style semi-self trainer: driver coordinates rollout, curriculum (`update_problems`), merge, and PPO.
+
+    Intended for single-node setups where the driver process orchestrates worker groups.
     """
 
     def compute_kl_related_metrics(self, batch: DataProto, metrics: dict, timing_raw: dict):
+        """Recompute `old_log_prob` (+ ref if enabled), entropy metric, and union onto `batch`."""
         batch.batch["response_mask"] = compute_response_mask(batch)
 
         # recompute old_log_probs
@@ -85,10 +88,9 @@ class RayDAPOTrainer(RayPPOTrainer):
 
     def fit(self):
         """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC
-        to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
+        Main training loop: each step calls `train_batch` (rollout, curriculum update, merge, PPO update).
+
+        The driver orchestrates workers via RPC; advantage and light-weight metrics run on the driver.
         """
         from omegaconf import OmegaConf
 
@@ -212,7 +214,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 self.gen_steps += 1
 
                 batch = None
-        # check if last step checkpint exists
+        # check if last step checkpoint exists
         checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
         if not os.path.exists(checkpoint_dir):
             # save last step checkpoint
@@ -226,15 +228,21 @@ class RayDAPOTrainer(RayPPOTrainer):
         return self.train_dataset.dataframe[problem_id]
 
 
-    def _merge_pending_generated_batch_into_train_batch(self, new_batch: DataProto,pending_generated_batch: DataProto) -> DataProto:
+    def _merge_pending_generated_batch_into_train_batch(
+        self, new_batch: DataProto, pending_generated_batch: Optional[DataProto]
+    ) -> DataProto:
         """
-        Merge pending generation rollout batch (from previous step's add_in_context_knowledge)
-        into the current train batch `new_batch`, assigning gen-step rewards from verifier acc.
+        Append rows from `pending_generated_batch` (rollout from `_generate_problem_variants` in the
+        same `train_batch`, before Pass 2) onto the Pass-2 batch `new_batch`, and set token-level
+        rewards from Pass-2 fields.
 
-        Uses super_uid -> average acc on the current `new_batch` to score generated samples
-        where parse succeeded; parse failures get a fixed penalty.
+        For each uid on `new_batch`, average `acc` over rollouts with that uid; for each appended
+        generated row, reward is that average if `knowledge` is non-empty for that uid, else -0.5.
         """
-        # super_uid -> average acc (for gen-step reward)
+        if pending_generated_batch is None:
+            return new_batch
+
+        # uid -> average acc on Pass-2 batch (for gen-step reward)
         uid_to_acc = {}
         uid_to_knowledge = {}
         acc_vals = new_batch.non_tensor_batch.get("acc", None)
@@ -311,9 +319,12 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         return new_batch
 
-    def _rollout_and_compute_reward(self, batch_dict,timing_raw):
+    def _rollout_and_compute_reward(self, batch_dict, _metrics, timing_raw):
         """
-        Rollout, RM / rule reward, update_action, merge pending gen batch -> training `batch`.
+        One rollout pass: `generate_sequences`, optional REMAX baseline, then RM + rule `compute_reward`,
+        filling `token_level_scores` / `token_level_rewards`.
+
+        `_metrics` is reserved for call-site symmetry with `train_batch` (unused here).
         """
         new_batch: DataProto = DataProto.from_single_dict(batch_dict)
         # pop those keys for generation
@@ -391,7 +402,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
                 )
 
-            # compute rewards. apply_kl_penalty if available
+            # Semi-self does not support folding KL into the reward; token rewards == scores.
             if self.config.algorithm.use_kl_in_reward:
                 raise NotImplementedError("use kl in reward is not supported for semi-self.")
             else:
@@ -403,27 +414,20 @@ class RayDAPOTrainer(RayPPOTrainer):
 
     def _compute_advantage_and_backward(self, batch, metrics, timing_raw, reward_extra_infos_dict):
         """
-        Balance batch, KL metrics, values, advantage, critic/actor update, logging, split return.
+        Optional DP balance, KL-related log-probs (when not using KL-in-reward), values, advantage,
+        rollout-correction (if configured), critic/actor updates, optional rollout logging.
         """
         # === Updating ===
-        # Balance the number of valid tokens across DP ranks.
-        # NOTE: This usually changes the order of data in the `batch`,
-        # which won't affect the advantage calculation (since it's based on uid),
-        # but might affect the loss calculation (due to the change of mini-batching).
-        # TODO: Decouple the DP balancing and mini-batching.
-        # Skip when batch_size is not divisible by world_size (e.g. semi-self merged batch 2052 % 8).
-        # world_size = self.actor_rollout_wg.world_size
-        # batch_size = batch.batch["attention_mask"].shape[0]
-        # pad_size = 0
-        # if batch_size % world_size != 0:
-        #     # Pad so DP chunk (e.g. compute_log_prob) can split evenly; trim before advantage.
-        #     batch, pad_size = pad_dataproto_to_divisor(batch, world_size)
+        # Optionally rebalance token counts across DP ranks (can reorder rows; affects minibatch grouping).
+        # Padding to world_size divisibility was explored for uneven merged batches (e.g. concat Pass-1+2);
+        # that path is disabled here—enable only if you restore pad/trim around advantage.
         if self.config.trainer.balance_batch:
             self._balance_batch(batch, metrics=metrics)
 
         # compute global_valid tokens
         batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+        # With KL-in-reward disabled, attach old (and optional ref) log-probs for the policy loss / KL terms.
         if not self.config.algorithm.use_kl_in_reward:
             batch = self.compute_kl_related_metrics(batch, metrics, timing_raw)
 
@@ -443,12 +447,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             metrics.update(is_metrics)
 
         with marked_timer("adv", timing_raw, "brown"):
-            # # Remove padding added for DP chunking so advantage is only over real samples.
-            # if pad_size > 0:
-            #     original_len = len(batch) - pad_size
-            #     batch = batch.select_idxs(list(range(original_len)))
-            #     batch.meta_info["global_token_num"] = batch.meta_info["global_token_num"][:original_len]
-            # compute advantages, executed on the driver process
+            # compute advantages on the driver (paired with pad/trim above if padding is re-enabled)
             norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
             batch = compute_advantage(
                 batch,
@@ -475,7 +474,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 batch.meta_info["reference_batch_size"] = (
                     self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
                 )
-                # 也把这两个信息打到 metrics 里，方便在 logger 中查看
+                # Log batch sizes used by normalize_update_by_reference_batch_size
                 metrics["train/actual_global_batch_size"] = batch.meta_info["actual_global_batch_size"]
                 metrics["train/reference_batch_size"] = batch.meta_info["reference_batch_size"]
                 actor_output = self.actor_rollout_wg.update_actor(batch)
@@ -510,11 +509,12 @@ class RayDAPOTrainer(RayPPOTrainer):
         timing_raw,
     ):
         """
-        1) Rollout + reward on the dataloader batch (for update_action / update_problems signals).
-        2) update_action -> update_problems (refresh train_problems).
-        3) Collate one batch from updated train_problems and run _rollout_and_compute_reward again
-           (this batch carries acc/reward used for merge + PPO backward).
-        4) Merge pending gen from previous step, then advantage + backward.
+        1) Pass 1: rollout + reward on the dataloader batch; `update_action` then `update_problems`
+           (may run `_generate_problem_variants`, producing `pending_generated_batch` for merge).
+        2) Pass 2: collate `train_problems` and rollout + reward again (`batch_with_knowledge`).
+        3) Merge `pending_generated_batch` into Pass 2 (reward from Pass-2 uid acc / knowledge), then
+           `batch_pass1.union(batch_with_knowledge)`.
+        4) Advantage + PPO backward on the combined batch.
         """
         metrics = {}
 
@@ -541,18 +541,19 @@ class RayDAPOTrainer(RayPPOTrainer):
                 ) = self.update_problems(batch)
 
 
-            # Pass 2: single batch from refreshed curriculum — same path as (606): rollout + reward
-            batach_dict_with_knowledge = self.collate_single_batch_from_train_problems(train_problems)
+            # Pass 2: collate from updated `train_problems`, then same rollout + reward as Pass 1
+            batch_dict_with_knowledge = self.collate_single_batch_from_train_problems(train_problems)
             batch_with_knowledge, reward_extra_infos_dict = self._rollout_and_compute_reward(
-                batach_dict_with_knowledge, metrics, timing_raw
+                batch_dict_with_knowledge, metrics, timing_raw
             )
-            
-            # Pass 3: merge pending generated batch, train batch ,batch_with_knowledge
-            batch_with_knowledge = self._merge_pending_generated_batch_into_train_batch(batch_with_knowledge,pending_generated_batch)
+
+            # Pass 3: attach last step's generated variants + rewards, then union Pass-1 and Pass-2 batches
+            batch_with_knowledge = self._merge_pending_generated_batch_into_train_batch(
+                batch_with_knowledge, pending_generated_batch
+            )
             batch = batch.union(batch_with_knowledge)
 
-
-            # Pass 4: compute advantage and backward
+            # Pass 4: advantage + PPO backward
             batch, metrics = self._compute_advantage_and_backward(
                 batch, metrics, timing_raw, reward_extra_infos_dict
             )
@@ -585,18 +586,19 @@ class RayDAPOTrainer(RayPPOTrainer):
         return inmemory_dataloader
     def update_problems(self, batch, num_variations_per_problem=8):
         """
-        Update problems based on actions in the batch.
+        Build the next curriculum: for each uid with action `add_in_context_knowledge`, call
+        `_generate_problem_variants` and expand `updated_problems` with new items (prompt + knowledge).
 
         Args:
-            batch: DataProto batch containing actions aggregated by uid
-            train_problems: Current list of training problems with their states
-            next_problem_id: Starting ID for newly appended problems
-            num_variations_per_problem: Number of new problems to generate per original problem (M)
+            batch: DataProto after `update_action`; must include `uid`, `action`, `problem_id`.
+            num_variations_per_problem: Variants per uid that requested in-context knowledge (M).
 
         Returns:
-            tuple: (updated_problems, new_next_problem_id, action_counts, generated_samples, pending_generated_batch)
-            - generated_samples: list of dicts with super_uid, problem_id, parsed_success (for RL reward in next train_batch)
-            - pending_generated_batch: DataProto from _generate_problem_variants (None if no generation)
+            (updated_problems, action_counts, pending_generated_batch)
+            - updated_problems: list of problem dicts for Pass-2 collate (see `train_batch`)
+            - action_counts: per-action tallies for logging
+            - pending_generated_batch: rollout `DataProto` from `_generate_problem_variants`, or None
+              if there was no `add_in_context_knowledge` work (consumed in the same `train_batch` merge).
         """
         # Get uids and actions from batch
         uids = batch.non_tensor_batch.get("uid", [])
@@ -634,11 +636,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             else:
                 action_counts['drop'] += 1
 
-        # We need original problem data - this should be stored in the batch
-        # For now, assume we can reconstruct or access original problems
-        # This might need to be adjusted based on how original problems are stored
-
-        # Phase 1: Collect all generation tasks for batch processing (per uid)
+        # Phase 1: uids that need LLM-generated knowledge variants
         generation_tasks = []  # List of (uid, action)
 
         for uid, action in uid_to_action.items():
@@ -677,8 +675,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         
 
 
-        # Phase 3: Build final updated_problems list (one per unique uid)
-        # Build generated_samples and pending_generated_batch for RL reward in next train_batch
+        # Phase 3: Flatten variants into `updated_problems`; keep generation rollout for merge after Pass 2
         pending_generated_batch = generated_output
         updated_problems = []
         
@@ -712,9 +709,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 "data_source": str(variant['uid']),
                             }
                             updated_problems.append(new_item)
+                        # Invalid or empty variant: skip (no row appended for that variant).
 
-                        # If action doesn't need add_knowledge, that prompt is dropped entirely.
-                        
                 else:
                     raise ValueError(f"Unexpect error for {original_problem_data}")
 
@@ -767,7 +763,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         uid_to_avg_acc = {uid: sum(vals) / len(vals) for uid, vals in uid_to_acc_list.items()}
 
-        # Store for Phase 0 in update_problems (cleanup by data_source)
+        # Optional: downstream or logging can read per-uid averages from meta_info
         batch.meta_info["uid_to_avg_acc"] = uid_to_avg_acc
         batch.meta_info["uid_to_avg_reward"] = uid_to_avg_acc  # backward compat: same values, acc-based
 
@@ -795,8 +791,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             data_source = uid_to_data_source.get(uid, "general-reasoner")
             # Update action based on average acc for this uid
             if data_source != "general-reasoner":
-                # Already augmented once, do not add knowledge again next round.
-                new_action = 'drop'
+                raise ValueError(f"data_source {data_source} is not supported")
             elif avg_acc < add_knowledge_threshold:
                 new_action = 'add_in_context_knowledge'
             else:
@@ -823,16 +818,18 @@ class RayDAPOTrainer(RayPPOTrainer):
 
     def _generate_problem_variants(self, original_problems, num_variations_per_problem=4):
         """
-        Generate in-context knowledge using LLM.
+        Generate in-context knowledge snippets with the policy and parse JSON from the reply.
 
         Args:
-            original_problems: List of dicts with 'problem', 'answer', and 'action'
-            num_variations_per_problem: Number of variants per problem
+            original_problems: List of dicts with at least 'problem' and 'action' (e.g. add_in_context_knowledge).
+            num_variations_per_problem: Rollout rows per source prompt (M).
 
         Returns:
-            tuple: (new_problems, add_knowledge_success_count)
-            - new_problems: List of dicts with 'problem', 'knowledge', and 'uid' keys
-            - add_knowledge_success_count: Number of parsed knowledge generations
+            (new_problems, add_knowledge_success_count, generated_output, parse_success_list)
+            - new_problems: Parsed dicts with 'problem', 'knowledge', 'uid' (fallback rows if parse fails)
+            - add_knowledge_success_count: Count where action is add_in_context_knowledge and parse succeeded
+            - generated_output: DataProto from `generate_sequences` (merged into Pass 2 in the same `train_batch`)
+            - parse_success_list: Per-row whether JSON list-of-strings parsed
         """
         import torch
         from verl import DataProto
