@@ -221,6 +221,12 @@ class RayDAPOTrainer(RayPPOTrainer):
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
                 timing_raw = defaultdict(float)  # clear timing
 
+
+                if "acc" in batch.non_tensor_batch:
+                    acc_vals = np.asarray(batch.non_tensor_batch["acc"], dtype=np.float32)
+                    if acc_vals.size > 0:
+                        metrics["reward_model/acc"] = float(np.mean(acc_vals))
+
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 

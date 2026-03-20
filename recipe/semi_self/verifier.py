@@ -2,6 +2,7 @@ import logging
 import os
 import re
 
+import numpy as np
 import torch
 from vllm import LLM, SamplingParams
 from verl.single_controller.base import Worker
@@ -157,12 +158,14 @@ class RewardModelWorker(Worker):
 
         # Initialize reward tensor with the same shape as responses.
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        scores_for_acc = []
 
         # Compute a reward score for each data item.
         for i, (ground_truth, solution, verification, valid_response_length) in enumerate(
             zip(ground_truths, solutions, responses, valid_response_lengths)
         ):
             score = 0.0
+            acc = 0.0
             # Penalize if solution extraction failed.
             if solution is None:
                 score -= 0.5
@@ -172,6 +175,7 @@ class RewardModelWorker(Worker):
             # Award a score and adjust based on token length difference if verification passes.
             if VERIFIER_PASS_TAG in verification:
                 score += 1.0
+                acc += 1.0
                 tokenized_solution = self.tokenizer.encode(solution)
                 tokenized_ground_truth = self.tokenizer.encode(ground_truth)
                 # Penalize based on the absolute difference in token count (capped to 10 tokens).
@@ -180,8 +184,10 @@ class RewardModelWorker(Worker):
                 score -= difference * 0.05
             # Record the score at the final valid response token index.
             reward_tensor[i, valid_response_length - 1] = score
+            scores_for_acc.append(acc)
 
         batch = TensorDict({"rm_scores": reward_tensor}, batch_size=reward_tensor.shape[0])
+        non_tensor_batch = {"acc": np.array(scores_for_acc, dtype=np.float32)}
         self.llm.sleep(2)
         torch.cuda.empty_cache()
-        return DataProto(batch=batch)
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
