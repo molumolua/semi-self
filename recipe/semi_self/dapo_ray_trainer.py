@@ -885,6 +885,14 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # Since batch is expanded, we need to get unique uids and their corresponding actions
         unique_uids = list(uid_to_avg_reward.keys())
+        batch_data_sources = batch.non_tensor_batch.get("data_source", [])
+        uid_to_data_source = {}
+        for i, uid in enumerate(uids):
+            if uid not in uid_to_data_source:
+                ds = batch_data_sources[i] if i < len(batch_data_sources) else "general-reasoner"
+                if ds is None or (isinstance(ds, str) and str(ds).strip() == ""):
+                    ds = "general-reasoner"
+                uid_to_data_source[uid] = str(ds)
 
         add_knowledge_threshold = getattr(
             self.config.data,
@@ -896,8 +904,12 @@ class RayDAPOTrainer(RayPPOTrainer):
         # Process each unique uid
         for uid in unique_uids:
             avg_reward = uid_to_avg_reward[uid]
+            data_source = uid_to_data_source.get(uid, "general-reasoner")
             # Update action based on average reward for this uid
-            if avg_reward < add_knowledge_threshold:
+            if data_source != "general-reasoner":
+                # Already augmented once, do not add knowledge again next round.
+                new_action = 'drop'
+            elif avg_reward < add_knowledge_threshold:
                 new_action = 'add_in_context_knowledge'
             else:
                 new_action = 'drop'
