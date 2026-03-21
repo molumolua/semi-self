@@ -256,9 +256,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                 if data_source is not None and str(data_source).strip() != "":
                     data_source = str(data_source)
                     if i < len(acc_vals):
-                        data_source_to_acc_list.setdefault(data_source, []).append(float(data_source[i]))
+                        data_source_to_acc_list.setdefault(data_source, []).append(float(acc_vals[i]))
             for data_source, a_list in data_source_to_acc_list.items():
-                data_source_to_acc[uid] = sum(a_list) / len(a_list)
+                data_source_to_acc[data_source] = sum(a_list) / len(a_list)
 
         if knowledge_vals is not None and data_sources is not None:
             # `knowledge` is a list of strings per row (see _generate_problem_variants), not scalars.
@@ -268,7 +268,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     data_source = str(data_source)
                     if i < len(knowledge_vals):
                         kv = knowledge_vals[i]
-                        data_source_to_knowledge[uid] = (
+                        data_source_to_knowledge[data_source] = (
                             bool(len(kv) > 0)
                             if isinstance(kv, (list, tuple, np.ndarray))
                             else bool(kv is not None and str(kv).strip() != "")
@@ -562,7 +562,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 batch_with_knowledge = self._merge_pending_generated_batch_into_train_batch(
                     batch_with_knowledge, pending_generated_batch
                 )
-                batch = batch.union(batch_with_knowledge)
+                batch = DataProto.concat([batch, batch_with_knowledge])
 
             # advantage + PPO backward (inner stages also record into timing_raw)
             with marked_timer("train_batch/ppo_backward", timing_raw, "pink"):
