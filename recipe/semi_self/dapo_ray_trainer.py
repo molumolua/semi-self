@@ -282,12 +282,12 @@ class RayDAPOTrainer(RayPPOTrainer):
         gen_uids = pending_batch.non_tensor_batch.get("uid", [])
         keep_indices = []
         for i, uid in enumerate(gen_uids):
-                parsed_success = data_source_to_knowledge.get(uid, False)
+                if uid not in data_source_to_acc or uid not in data_source_to_knowledge:
+                    raise ValueError(f"uid {uid} not found in data_source_to_acc or data_source_to_knowledge") 
+                parsed_success = data_source_to_knowledge[uid]
                 if not parsed_success:
                     r_gen = -0.5
                 else:
-                    if uid not in data_source_to_acc:
-                        raise ValueError(f"uid {uid} not found in data_source_to_acc")
                     acc = data_source_to_acc[uid]
                     r_gen = acc
                 keep_indices.append(i)
