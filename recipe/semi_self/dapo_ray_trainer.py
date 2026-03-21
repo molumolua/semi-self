@@ -261,13 +261,18 @@ class RayDAPOTrainer(RayPPOTrainer):
                 uid_to_acc[uid] = sum(a_list) / len(a_list)
 
         if knowledge_vals is not None and uids is not None:
-            knowledge_vals = np.asarray(knowledge_vals, dtype=np.float32)
+            # `knowledge` is a list of strings per row (see _generate_problem_variants), not scalars.
             for i in range(len(uids)):
                 uid = uids[i]
                 if uid is not None and str(uid).strip() != "":
                     uid = str(uid)
                     if i < len(knowledge_vals):
-                        uid_to_knowledge[uid]=bool(len(knowledge_vals[i]) > 0)
+                        kv = knowledge_vals[i]
+                        uid_to_knowledge[uid] = (
+                            bool(len(kv) > 0)
+                            if isinstance(kv, (list, tuple, np.ndarray))
+                            else bool(kv is not None and str(kv).strip() != "")
+                        )
 
         pending_batch = pending_generated_batch
 
@@ -794,6 +799,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         updated_actions = []
 
         # Process each unique uid
+        add_knowledge_count = 0
         for uid in unique_uids:
             avg_acc = uid_to_avg_acc[uid]
             data_source = uid_to_data_source.get(uid, "general-reasoner")
@@ -801,7 +807,11 @@ class RayDAPOTrainer(RayPPOTrainer):
             if data_source != "general-reasoner":
                 raise ValueError(f"data_source {data_source} is not supported")
             elif avg_acc < add_knowledge_threshold:
-                new_action = 'add_in_context_knowledge'
+                if add_knowledge_count <= 5:
+                    new_action = 'add_in_context_knowledge'
+                else:
+                    new_action = 'drop'
+                add_knowledge_count +=1
             else:
                 new_action = 'drop'
 
