@@ -243,32 +243,32 @@ class RayDAPOTrainer(RayPPOTrainer):
             return new_batch
 
         # uid -> average acc on Pass-2 batch (for gen-step reward)
-        uid_to_acc = {}
-        uid_to_knowledge = {}
+        data_source_to_acc = {}
+        data_source_to_knowledge = {}
         acc_vals = new_batch.non_tensor_batch.get("acc", None)
         knowledge_vals = new_batch.non_tensor_batch.get("knowledge", None)
-        uids = new_batch.non_tensor_batch.get("uid", None)
-        if acc_vals is not None and uids is not None:
+        data_sources = new_batch.non_tensor_batch.get("data_source", None)
+        if acc_vals is not None and data_sources is not None:
             acc_vals = np.asarray(acc_vals, dtype=np.float32)
-            uid_to_acc_list = {}
-            for i in range(len(uids)):
-                uid = uids[i]
-                if uid is not None and str(uid).strip() != "":
-                    uid = str(uid)
+            data_source_to_acc_list = {}
+            for i in range(len(data_sources)):
+                data_source = data_sources[i]
+                if data_source is not None and str(data_source).strip() != "":
+                    data_source = str(data_source)
                     if i < len(acc_vals):
-                        uid_to_acc_list.setdefault(uid, []).append(float(acc_vals[i]))
-            for uid, a_list in uid_to_acc_list.items():
-                uid_to_acc[uid] = sum(a_list) / len(a_list)
+                        data_source_to_acc_list.setdefault(data_source, []).append(float(data_source[i]))
+            for data_source, a_list in data_source_to_acc_list.items():
+                data_source_to_acc[uid] = sum(a_list) / len(a_list)
 
-        if knowledge_vals is not None and uids is not None:
+        if knowledge_vals is not None and data_sources is not None:
             # `knowledge` is a list of strings per row (see _generate_problem_variants), not scalars.
-            for i in range(len(uids)):
-                uid = uids[i]
-                if uid is not None and str(uid).strip() != "":
-                    uid = str(uid)
+            for i in range(len(data_sources)):
+                data_source = data_sources[i]
+                if data_source is not None and str(data_source).strip() != "":
+                    data_source = str(data_source)
                     if i < len(knowledge_vals):
                         kv = knowledge_vals[i]
-                        uid_to_knowledge[uid] = (
+                        data_source_to_knowledge[uid] = (
                             bool(len(kv) > 0)
                             if isinstance(kv, (list, tuple, np.ndarray))
                             else bool(kv is not None and str(kv).strip() != "")
@@ -279,15 +279,16 @@ class RayDAPOTrainer(RayPPOTrainer):
         device = pending_batch.batch["attention_mask"].device
         response_length = int(pending_batch.batch["responses"].shape[1])
         token_level_rewards_list = []
+        gen_uids = pending_batch.non_tensor_batch.get("uid", [])
         keep_indices = []
-        for i, uid in enumerate(uids):
-                parsed_success = uid_to_knowledge.get(uid, False)
+        for i, uid in enumerate(gen_uids):
+                parsed_success = data_source_to_knowledge.get(uid, False)
                 if not parsed_success:
                     r_gen = -0.5
                 else:
-                    if uid not in uid_to_acc:
-                        raise ValueError(f"uid {uid} not found in uid_to_acc")
-                    acc = uid_to_acc[uid]
+                    if uid not in data_source_to_acc:
+                        raise ValueError(f"uid {uid} not found in data_source_to_acc")
+                    acc = data_source_to_acc[uid]
                     r_gen = acc
                 keep_indices.append(i)
                 valid_response_len = int(pending_batch.batch["attention_mask"][i, -response_length:].sum().item())
@@ -311,9 +312,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     non_tensor_batch=sub_non_tensor,
                     meta_info=dict(pending_batch.meta_info),
                 )
-                added_batch.non_tensor_batch["uid"] = np.array(
-                    [f"gen_{i}" for i in range(len(keep_indices))], dtype=object
-                )
+                added_batch.non_tensor_batch["uid"] = gen_uids
 
                 for k in new_batch.non_tensor_batch.keys():
                     if k not in added_batch.non_tensor_batch:
@@ -955,16 +954,9 @@ Do not include any explanation or markdown.
         )
 
         # One uid per original prompt, repeated for each variation of that prompt
-        num_prompts = len(prompts)
-        uid_per_prompt = [str(uuid.uuid4()) for _ in range(num_prompts)]
-        uid_array = np.array(
-            [uid_per_prompt[i // num_variations_per_problem] for i in range(len(repeated_prompts))],
-            dtype=object,
-        )
         gen_batch = DataProto(
             batch=batch,
             non_tensor_batch={
-                "uid": uid_array,
                 "data_source": np.array(["update_problems"] * len(repeated_prompts)),
                 "raw_prompt_ids": np.array(raw_prompt_ids_list, dtype=object),
             },
@@ -1007,7 +999,6 @@ Do not include any explanation or markdown.
                 parsed_data = json.loads(json_str)
 
                 if isinstance(parsed_data, list) and all(isinstance(item, str) for item in parsed_data):
-                    uid_i = gen_batch.non_tensor_batch["uid"][i]
                     original_idx = i // num_variations_per_problem
                     original_problem_text = ""
                     if original_idx < len(original_problems):
@@ -1023,7 +1014,7 @@ Do not include any explanation or markdown.
                     parsed_problem = {
                         'problem': combined_problem,
                         'knowledge': knowledge_lines,
-                        'uid': uid_i,
+                        'uid': str(uuid.uuid4()),
                     }
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
@@ -1041,7 +1032,6 @@ Do not include any explanation or markdown.
                         add_knowledge_success_count += 1
             else:
                 # Fallback
-                uid_i = gen_batch.non_tensor_batch["uid"][i]
                 original_idx = i // num_variations_per_problem
                 original_problem_text = ""
                 if original_idx < len(original_problems):
@@ -1049,7 +1039,7 @@ Do not include any explanation or markdown.
                 new_problems.append({
                     'problem': original_problem_text,
                     'knowledge': [],
-                    'uid': uid_i,
+                    'uid': str(uuid.uuid4()),
                 })
             # Log the first case as an example
             if i == 0:
