@@ -111,6 +111,11 @@ class RayDAPOTrainer(RayPPOTrainer):
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        # build map from problem_id to problem
+        self.all_train_items = {}
+        for item in self.train_dataset.dataframe:
+            self.all_train_items[item['problem_id']] = item
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
@@ -225,11 +230,14 @@ class RayDAPOTrainer(RayPPOTrainer):
             logger.log(data=metrics, step=self.global_steps)
 
     def get_item_from_all_train(self, problem_id):
-        return self.train_dataset.dataframe[problem_id]
+        return self.all_train_items[problem_id]
 
 
     def _merge_pending_generated_batch_into_train_batch(
-        self, new_batch: DataProto, pending_generated_batch: Optional[DataProto]
+        self,
+        new_batch: DataProto,
+        pending_generated_batch: Optional[DataProto],
+        metrics: Optional[dict] = None,
     ) -> DataProto:
         """
         Append rows from `pending_generated_batch` (rollout from `_generate_problem_variants` in the
@@ -281,6 +289,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         token_level_rewards_list = []
         gen_uids = pending_batch.non_tensor_batch.get("uid", [])
         keep_indices = []
+        merge_acc_used = []
+        merge_r_gen = []
         for i, uid in enumerate(gen_uids):
                 if uid not in data_source_to_acc or uid not in data_source_to_knowledge:
                     raise ValueError(f"uid {uid} not found in data_source_to_acc or data_source_to_knowledge") 
@@ -290,6 +300,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                 else:
                     acc = data_source_to_acc[uid]
                     r_gen = acc
+                    merge_acc_used.append(float(acc))
+                merge_r_gen.append(float(r_gen))
                 keep_indices.append(i)
                 valid_response_len = int(pending_batch.batch["attention_mask"][i, -response_length:].sum().item())
                 last_pos_in_response = valid_response_len - 1
@@ -297,6 +309,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                 if last_pos_in_response >= 0:
                     r_vec[last_pos_in_response] = float(r_gen)
                 token_level_rewards_list.append(r_vec.unsqueeze(0))
+
+        if metrics is not None and merge_r_gen:
+            metrics["semi_self/pending_merge/mean_gen_step_reward"] = float(np.mean(merge_r_gen))
+            metrics["semi_self/pending_merge/n_gen_rows"] = len(merge_r_gen)
+            if merge_acc_used:
+                metrics["semi_self/pending_merge/mean_acc"] = float(np.mean(merge_acc_used))
+            metrics["semi_self/pending_merge/knowledge_ok_frac"] = float(len(merge_acc_used)) / float(len(merge_r_gen))
 
         if keep_indices:
                 idx = torch.tensor(keep_indices, dtype=torch.long, device=device)
@@ -537,7 +556,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                 batch, reward_extra_infos_dict = self._rollout_and_compute_reward(batch_dict, metrics, timing_raw)
 
             with marked_timer("train_batch/update_action", timing_raw, "blue"):
-                self.update_action(batch)
+                self.update_action(batch, metrics)
 
             with marked_timer("train_batch/update_problems", timing_raw, "blue"):
                 (
@@ -560,7 +579,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             # attach generated variants + rewards, then union Pass-1 and Pass-2 batches
             with marked_timer("train_batch/merge_and_union", timing_raw, "blue"):
                 batch_with_knowledge = self._merge_pending_generated_batch_into_train_batch(
-                    batch_with_knowledge, pending_generated_batch
+                    batch_with_knowledge, pending_generated_batch, metrics
                 )
                 batch = DataProto.concat([batch, batch_with_knowledge])
 
@@ -618,7 +637,6 @@ class RayDAPOTrainer(RayPPOTrainer):
         actions = batch.non_tensor_batch.get("action", [])
         problem_ids = batch.non_tensor_batch.get("problem_id", [])
         
-
         
 
 
@@ -751,12 +769,14 @@ class RayDAPOTrainer(RayPPOTrainer):
             updated_problems.append(updated_problem)
         return updated_problems, current_id
 
-    def update_action(self, batch: DataProto):
+    def update_action(self, batch: DataProto, metrics: Optional[dict] = None):
         """
         Update actions based on verifier accuracy (acc), aggregated by uid.
 
         Args:
             batch: DataProto containing non_tensor_batch["acc"] and uids
+            metrics: If given, logs `semi_self/add_in_context_item_avg_acc` (mean acc over uids
+                selected for add_in_context_knowledge, capped at 5; -1 if none).
         """
         acc_vals = batch.non_tensor_batch.get("acc", None)
         uids = batch.non_tensor_batch.get("uid", [])
@@ -796,6 +816,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             getattr(self.config.data, 'degrade_threshold', -0.2),
         )
         updated_actions = []
+        add_in_context_item_acc = []
 
         # Process each unique uid
         add_knowledge_count = 0
@@ -808,6 +829,7 @@ class RayDAPOTrainer(RayPPOTrainer):
             elif avg_acc < add_knowledge_threshold:
                 if add_knowledge_count <= 5:
                     new_action = 'add_in_context_knowledge'
+                    add_in_context_item_acc.append(avg_acc)
                 else:
                     new_action = 'drop'
                 add_knowledge_count +=1
@@ -816,7 +838,12 @@ class RayDAPOTrainer(RayPPOTrainer):
 
             # Store per-uid results
             updated_actions.append(new_action)
-
+        if len(add_in_context_item_acc) > 0:
+            add_in_context_item_avg_acc = sum(add_in_context_item_acc) / len(add_in_context_item_acc)
+        else:
+            add_in_context_item_avg_acc = -1.0
+        if metrics is not None:
+            metrics["semi_self/add_in_context_item_avg_acc"] = float(add_in_context_item_avg_acc)
         # Update the batch with new actions (per-uid)
         # Note: Since batch is expanded with multiple samples per uid, we need to
         # replicate the per-uid actions for all samples of each uid
