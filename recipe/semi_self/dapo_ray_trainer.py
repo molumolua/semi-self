@@ -316,6 +316,8 @@ class RayDAPOTrainer(RayPPOTrainer):
             if merge_acc_used:
                 metrics["semi_self/pending_merge/mean_acc"] = float(np.mean(merge_acc_used))
             metrics["semi_self/pending_merge/knowledge_ok_frac"] = float(len(merge_acc_used)) / float(len(merge_r_gen))
+        else:
+            raise ValueError(f"merge_r_gen is empty when merging pending generated batch. len={len(merge_r_gen)}, len metric = {len(metrics)}.")
 
         if keep_indices:
                 idx = torch.tensor(keep_indices, dtype=torch.long, device=device)
