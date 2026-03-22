@@ -203,8 +203,9 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 if "acc" in batch.non_tensor_batch:
                     acc_vals = np.asarray(batch.non_tensor_batch["acc"], dtype=np.float32)
-                    if acc_vals.size > 0:
-                        metrics["reward_model/acc"] = float(np.mean(acc_vals))
+                    acc_finite = acc_vals[np.isfinite(acc_vals)]
+                    if acc_finite.size > 0:
+                        metrics["reward_model/acc"] = float(np.mean(acc_finite))
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
