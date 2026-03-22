@@ -18,7 +18,7 @@ tensor_model_parallel_size=4
 reward_model_name="TIGER-Lab/general-verifier"
 
 epoch=1000
-project_name='semi-self'
+project_name='In-Context RL'
 
 lr_warmup_steps=0
 lr=1e-6
