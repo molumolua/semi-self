@@ -874,7 +874,8 @@ class RayDAPOTrainer(RayPPOTrainer):
             (new_problems, add_knowledge_success_count, generated_output, parse_success_list)
             - new_problems: Parsed dicts with 'problem', 'knowledge', 'uid' (fallback rows if parse fails)
             - add_knowledge_success_count: Count where action is add_in_context_knowledge and parse succeeded
-            - generated_output: DataProto from `generate_sequences` (merged into Pass 2 in the same `train_batch`)
+            - generated_output: DataProto from `generate_sequences` (merged into Pass 2 in the same `train_batch`);
+                includes `non_tensor_batch["uid"]` per row, aligned with `new_problems[*]["uid"]`.
             - parse_success_list: Per-row whether JSON list-of-strings parsed
         """
         import torch
@@ -997,9 +998,11 @@ Do not include any explanation or markdown.
                 "max_new_tokens": self.config.data.max_response_length,
             },
         )
+        variant_row_uids = np.array([str(uuid.uuid4()) for _ in range(len(repeated_prompts))], dtype=object)
         pprint(f"Generating {len(repeated_prompts)} variants ({len(prompts)} problems x {num_variations_per_problem} variations)")
         # Generate new problems using the policy model
         generated_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+        generated_output.non_tensor_batch["uid"] = variant_row_uids
 
         # Extract the generated text
         generated_sequences = generated_output.batch["input_ids"]
@@ -1043,7 +1046,7 @@ Do not include any explanation or markdown.
                     parsed_problem = {
                         'problem': combined_problem,
                         'knowledge': knowledge_lines,
-                        'uid': str(uuid.uuid4()),
+                        'uid': variant_row_uids[i],
                     }
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
@@ -1068,7 +1071,7 @@ Do not include any explanation or markdown.
                 new_problems.append({
                     'problem': original_problem_text,
                     'knowledge': [],
-                    'uid': str(uuid.uuid4()),
+                    'uid': variant_row_uids[i],
                 })
             # Log the first case as an example
             if i == 0:
